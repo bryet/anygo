@@ -5,8 +5,8 @@ import (
 	"io"
 	"net"
 
-	"anytls-forward/config"
-	"anytls-forward/pkg/padding"
+	"config"
+	"pkg/padding"
 	"github.com/xtaci/smux"
 )
 
