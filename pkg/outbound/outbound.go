@@ -8,8 +8,8 @@ import (
 	"net"
 	"time"
 
-	"config"
-	"pkg/tunnel"
+	"anygo/config"
+	"anygo/pkg/tunnel"
 	"github.com/xtaci/smux"
 )
 
