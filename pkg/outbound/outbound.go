@@ -8,8 +8,8 @@ import (
 	"net"
 	"time"
 
-	"anytls-forward/config"
-	"anytls-forward/pkg/tunnel"
+	"config"
+	"pkg/tunnel"
 	"github.com/xtaci/smux"
 )
 
