@@ -3,7 +3,6 @@ package inbound
 import (
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -32,20 +31,18 @@ type Inbound struct {
 }
 
 func New(cfg *config.Config) *Inbound {
-	ib := &Inbound{
+	return &Inbound{
 		cfg:    cfg,
 		scheme: padding.Default(),
 	}
-	return ib
 }
 
 func (ib *Inbound) Run() error {
-	// 初始化Session池
 	ib.pool = session.NewPool(
 		ib.dialSession,
-		30*time.Second, // 检查间隔
-		60*time.Second, // 空闲超时
-		2,              // 最少保留2个空闲Session
+		30*time.Second,
+		60*time.Second,
+		2,
 	)
 
 	listener, err := net.Listen("tcp", ib.cfg.Listen)
@@ -53,7 +50,7 @@ func (ib *Inbound) Run() error {
 		return err
 	}
 	log.Printf("[inbound] 监听 %s", ib.cfg.Listen)
-	log.Printf("[inbound] 出口服务器: %s  SNI: %s", ib.cfg.Remote, ib.cfg.SNI)
+	log.Printf("[inbound] 出口服务器: %s  SNI: %s  insecure: %v", ib.cfg.Remote, ib.cfg.SNI, ib.cfg.Insecure)
 
 	for {
 		conn, err := listener.Accept()
@@ -65,80 +62,69 @@ func (ib *Inbound) Run() error {
 	}
 }
 
-// dialSession 新建一个到出口服务器的ClientSession（注入到Pool）
 func (ib *Inbound) dialSession() (*session.ClientSession, error) {
 	conn, err := ib.dialTLS()
 	if err != nil {
 		return nil, err
 	}
-
-	// 发送认证包：sha256(password) + padding0
 	if err := ib.sendAuth(conn); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("auth failed: %w", err)
 	}
-
-	// 建立ClientSession（内部发送cmdSettings）
 	cs, err := session.NewClientSession(conn, ib.cfg.Password, ib.scheme)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("session handshake failed: %w", err)
 	}
-
 	return cs, nil
 }
 
-// dialTLS 建立TLS连接，使用uTLS伪装Chrome指纹
+// dialTLS 建立TLS连接：
+//   - 有 SNI：始终使用 uTLS 伪装 Chrome 指纹；insecure 控制是否验证证书
+//     - insecure=false（真实域名证书）：正常验证
+//     - insecure=true（自签证书）：跳过验证
+//   - 无 SNI + insecure=true：自签证书且无需指纹伪装，使用标准 Go TLS
 func (ib *Inbound) dialTLS() (net.Conn, error) {
 	tcpConn, err := net.DialTimeout("tcp", ib.cfg.Remote, dialTimeout)
 	if err != nil {
 		return nil, err
 	}
 
-	if ib.cfg.Insecure {
-		// 自签证书：跳过验证，使用标准TLS
-		tlsConfig := &tls.Config{
+	if ib.cfg.SNI != "" {
+		// 有 SNI：使用 uTLS 伪装 Chrome 指纹
+		tlsConfig := &utls.Config{
 			ServerName:         ib.cfg.SNI,
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: ib.cfg.Insecure,
 		}
-		tlsConn := tls.Client(tcpConn, tlsConfig)
-		if err := tlsConn.Handshake(); err != nil {
+		uConn := utls.UClient(tcpConn, tlsConfig, utls.HelloChrome_Auto)
+		if err := uConn.Handshake(); err != nil {
 			tcpConn.Close()
 			return nil, err
 		}
-		return tlsConn, nil
+		return uConn, nil
 	}
 
-	// 正式证书：使用uTLS伪装Chrome指纹
-	tlsConfig := &utls.Config{
-		ServerName:         ib.cfg.SNI,
-		InsecureSkipVerify: false,
+	// 无 SNI：标准 Go TLS，跳过证书验证
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
 	}
-	uConn := utls.UClient(tcpConn, tlsConfig, utls.HelloChrome_Auto)
-	if err := uConn.Handshake(); err != nil {
+	tlsConn := tls.Client(tcpConn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
 		tcpConn.Close()
 		return nil, err
 	}
-	return uConn, nil
+	return tlsConn, nil
 }
 
-// sendAuth 发送认证包
 func (ib *Inbound) sendAuth(conn net.Conn) error {
-	// sha256(password)
 	h := sha256.Sum256([]byte(ib.cfg.Password))
-
-	// padding0大小由当前scheme决定
-	padding0Size := ib.scheme.Padding0Size()
-	padding0 := padding.RandBytes(padding0Size)
-
+	padding0 := padding.RandBytes(ib.scheme.Padding0Size())
 	return frame.WriteAuth(conn, h[:], padding0)
 }
 
-// handleConn 处理一个客户端TCP连接
 func (ib *Inbound) handleConn(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	// 从Pool获取Stream（含Session复用逻辑）
 	stream, cs, err := ib.pool.GetStream()
 	if err != nil {
 		log.Printf("[inbound] 获取stream失败: %v", err)
@@ -146,35 +132,13 @@ func (ib *Inbound) handleConn(clientConn net.Conn) {
 	}
 	defer func() {
 		stream.Close()
-		// Stream用完放回Session池
 		ib.pool.ReturnSession(cs)
 	}()
 
-	// 发送目标地址（SocksAddr格式）
-	// 在anygo中，目标地址就是配置的remote（透明转发）
-	target := ib.cfg.Remote
-	if err := writeSocksAddr(stream, target); err != nil {
-		log.Printf("[inbound] 发送目标地址失败: %v", err)
-		return
-	}
-
-	log.Printf("[inbound] stream #%d → %s", stream.ID(), target)
-
-	// 双向中继
+	log.Printf("[inbound] stream #%d 已建立", stream.ID())
 	relay(clientConn, stream)
 }
 
-// writeSocksAddr 向stream写入目标地址（简化版：直接写host:port字符串，用2字节长度前缀）
-func writeSocksAddr(w io.Writer, addr string) error {
-	b := []byte(addr)
-	buf := make([]byte, 2+len(b))
-	binary.BigEndian.PutUint16(buf[:2], uint16(len(b)))
-	copy(buf[2:], b)
-	_, err := w.Write(buf)
-	return err
-}
-
-// relay 双向转发
 func relay(a, b io.ReadWriter) {
 	done := make(chan struct{}, 2)
 	go func() {
