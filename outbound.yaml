@@ -1,0 +1,7 @@
+listen: "0.0.0.0:443"         # 监听隧道出口（接受境内节点连接）
+remote: "149.154.167.51:443" # 目标服务器（如Telegram服务器）
+cert: "/etc/letsencrypt/live/example.com/fullchain.pem"
+key:  "/etc/letsencrypt/live/example.com/privkey.pem"
+password: "your-password"    # 认证密钥（与入口保持一致）
+padding:
+  templates: [64, 128, 256, 512, 1024, 1440, 2048]
