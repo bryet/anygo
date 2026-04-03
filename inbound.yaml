@@ -1,6 +1,0 @@
-listen: "0.0.0.0:1080"        # 监听隧道入口（客户端连这里）
-remote: "your-vps.com:443"   # 境外出口服务器地址
-sni: "www.cloudflare.com"    # TLS伪装域名（需是真实存在的域名）
-password: "your-password"    # 认证密钥（与出口保持一致）
-padding:
-  templates: [64, 128, 256, 512, 1024, 1440, 2048]
