@@ -3,12 +3,10 @@ package outbound
 import (
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
 
 	"anygo/config"
 	"anygo/pkg/frame"
@@ -24,7 +22,6 @@ type Outbound struct {
 
 func New(cfg *config.Config) *Outbound {
 	scheme := padding.Default()
-	// 如果配置了自定义paddingScheme，使用自定义的
 	if cfg.PaddingScheme != "" {
 		s, err := padding.Parse(cfg.PaddingScheme)
 		if err != nil {
@@ -48,7 +45,8 @@ func (ob *Outbound) Run() error {
 	}
 
 	log.Printf("[outbound] 监听 %s", ob.cfg.Listen)
-	log.Printf("[outbound] 目标服务器: %s", ob.cfg.Remote)
+	log.Printf("[outbound] SNI: %s", ob.cfg.SNI)
+	log.Printf("[outbound] 转发目标: %s", ob.cfg.Remote)
 	log.Printf("[outbound] PaddingScheme md5: %s", ob.scheme.MD5())
 
 	for {
@@ -61,7 +59,6 @@ func (ob *Outbound) Run() error {
 	}
 }
 
-// buildTLSConfig 构建TLS配置，支持自签证书
 func (ob *Outbound) buildTLSConfig() (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(ob.cfg.Cert, ob.cfg.Key)
 	if err != nil {
@@ -73,11 +70,9 @@ func (ob *Outbound) buildTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
-// handleConn 处理一个来自inbound的连接
 func (ob *Outbound) handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	// 1. 认证
 	if err := ob.authenticate(conn); err != nil {
 		log.Printf("[outbound] 认证失败 from %s: %v，fallback HTTP", conn.RemoteAddr(), err)
 		ob.fallbackHTTP(conn)
@@ -85,14 +80,12 @@ func (ob *Outbound) handleConn(conn net.Conn) {
 	}
 	log.Printf("[outbound] 认证成功: %s", conn.RemoteAddr())
 
-	// 2. 建立ServerSession（内部等待cmdSettings并完成握手）
 	ss, err := session.NewServerSession(conn, ob.scheme)
 	if err != nil {
 		log.Printf("[outbound] session握手失败: %v", err)
 		return
 	}
 
-	// 3. 循环接受Stream
 	for {
 		stream, err := ss.AcceptStream()
 		if err != nil {
@@ -102,74 +95,36 @@ func (ob *Outbound) handleConn(conn net.Conn) {
 	}
 }
 
-// authenticate 验证认证包
 func (ob *Outbound) authenticate(conn net.Conn) error {
 	passwordHash, _, err := frame.ReadAuth(conn)
 	if err != nil {
 		return fmt.Errorf("读取认证包失败: %w", err)
 	}
-
 	expected := sha256.Sum256([]byte(ob.cfg.Password))
 	if !equalBytes(passwordHash, expected[:]) {
 		return fmt.Errorf("密码错误")
 	}
-
 	return nil
 }
 
-// handleStream 处理一个Stream：读目标地址，连接目标，双向中继
 func (ob *Outbound) handleStream(stream *session.Stream) {
 	defer stream.Close()
 
-	// 读目标地址（2字节长度前缀 + 地址字符串）
-	target, err := readSocksAddr(stream)
+	targetConn, err := net.Dial("tcp", ob.cfg.Remote)
 	if err != nil {
-		log.Printf("[outbound] 读取目标地址失败: %v", err)
-		return
-	}
-
-	// 连接目标服务器
-	targetConn, err := net.Dial("tcp", target)
-	if err != nil {
-		log.Printf("[outbound] 连接目标 %s 失败: %v", target, err)
+		log.Printf("[outbound] 连接目标 %s 失败: %v", ob.cfg.Remote, err)
 		return
 	}
 	defer targetConn.Close()
 
-	log.Printf("[outbound] stream #%d → %s", stream.ID(), target)
-
-	// 双向中继
+	log.Printf("[outbound] stream #%d → %s", stream.ID(), ob.cfg.Remote)
 	relay(stream, targetConn)
 }
 
-// readSocksAddr 读取目标地址（2字节长度前缀 + 地址字符串）
-func readSocksAddr(r io.Reader) (string, error) {
-	lenBuf := make([]byte, 2)
-	if _, err := io.ReadFull(r, lenBuf); err != nil {
-		return "", err
-	}
-	addrLen := binary.BigEndian.Uint16(lenBuf)
-	addrBuf := make([]byte, addrLen)
-	if _, err := io.ReadFull(r, addrBuf); err != nil {
-		return "", err
-	}
-	return string(addrBuf), nil
-}
-
-// fallbackHTTP 认证失败时返回正常HTTP响应（防主动探测）
 func (ob *Outbound) fallbackHTTP(conn net.Conn) {
-	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		Proto:      "HTTP/1.1",
-		Header:     http.Header{"Content-Type": []string{"text/html"}},
-		Body:       io.NopCloser(nil),
-	}
-	_ = resp
-	// 简单返回一个正常页面
 	conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\nHello, World!"))
 }
 
-// relay 双向转发
 func relay(a, b io.ReadWriter) {
 	done := make(chan struct{}, 2)
 	go func() {
