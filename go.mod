@@ -1,4 +1,4 @@
-module anytls-forward
+module anygo
 
 go 1.22
 
