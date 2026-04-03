@@ -5,9 +5,9 @@ import (
 	"log"
 	"os"
 
-	"config"
-	"pkg/inbound"
-	"pkg/outbound"
+	"anygo/config"
+	"anygo/pkg/inbound"
+	"anygo/pkg/outbound"
 )
 
 func main() {
