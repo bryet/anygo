@@ -5,9 +5,9 @@ import (
 	"log"
 	"os"
 
-	"anytls-forward/config"
-	"anytls-forward/pkg/inbound"
-	"anytls-forward/pkg/outbound"
+	"config"
+	"pkg/inbound"
+	"pkg/outbound"
 )
 
 func main() {
