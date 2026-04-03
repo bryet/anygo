@@ -10,7 +10,7 @@ insecure: true
 
 # Session管理（可选）
 idle_session_check_interval: "30s"
-idle_session_timeout: "60s"
+idle_session_timeout: "5s"
 min_idle_session: 2
 
 
