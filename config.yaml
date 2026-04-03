@@ -1,12 +1,9 @@
 # anygo 境内入口配置，用户自行区分
-listen: "0.0.0.0:1080"        # 监听地址，接受本地TCP连接
-remote: "your-vps.com:443"    # 境外出口服务器地址
-sni: "www.cloudflare.com"     # TLS伪装域名（使用真实存在的域名）
-password: "your-password"     # 与出口保持一致
-
-# 自签证书模式（二选一）
-# sni 可省略，改为：
-insecure: true
+listen: "0.0.0.0:44713"        # 监听地址，接受本地TCP连接
+remote: "152.69.235.79:44713"    # 境外出口服务器地址
+sni: "bing.com"     # TLS伪装域名
+insecure: true     # 真实域名证书请注释本行
+password: "lMgab3FiW5"     # 与出口保持一致
 
 # Session管理（可选）
 idle_session_check_interval: "30s"
@@ -15,13 +12,14 @@ min_idle_session: 2
 
 
 # anygo 境外出口配置，用户自行区分
-listen: "0.0.0.0:443"         # 监听地址，接受境内入口连接
-remote: "149.154.167.51:443"  # 目标服务器（如 Telegram）
-password: "your-password"     # 与入口保持一致
+listen: "0.0.0.0:44713"         # 监听地址，接受境内入口连接
+remote: "127.0.0.1:25256"  # 目标服务器
+sni: "bing.com"     # TLS伪装域名
+password: "lMgab3FiW5"     # 与入口保持一致
 
 # TLS证书（支持 Let's Encrypt 或自签证书）
-cert: "/etc/anygo/server.crt"
-key:  "/etc/anygo/server.key"
+cert: "/var/anygo/server.crt"
+key:  "/var/anygo/server.key"
 
 # 自定义 PaddingScheme（可选，留空使用默认值）
 padding_scheme: |
