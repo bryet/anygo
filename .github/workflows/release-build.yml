@@ -52,19 +52,18 @@ jobs:
         run: |
           go build -trimpath \
             -ldflags "-s -w -buildid=" \
-            -o mtpgo ./cmd/mtpgo/
+            -o anygo .
 
-          tar -czf "mtpgo-linux-${{ matrix.arch }}.tar.gz" \
-            mtpgo \
-            mtpgo.service \
-            mtpgo_openrc \
-            config.ini
+          tar -czf "anygo-linux-${{ matrix.arch }}.tar.gz" \
+            anygo \
+            anygo.service \
+            config.yaml
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: build-linux-${{ matrix.arch }}
-          path: mtpgo-linux-${{ matrix.arch }}.tar.gz
+          path: anygo-linux-${{ matrix.arch }}.tar.gz
           retention-days: 1
 
   release:
