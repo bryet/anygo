@@ -11,16 +11,16 @@ import (
 type Config struct {
 	// 通用
 	Listen   string `yaml:"listen"`
-	Remote   string `yaml:"remote"`
 	Password string `yaml:"password"`
+	SNI      string `yaml:"sni"`    // TLS伪装域名（inbound用于握手，outbound仅日志展示）
+	Remote   string `yaml:"remote"` // inbound: outbound服务器地址；outbound: 最终转发目标地址
 
 	// inbound专有
-	SNI      string `yaml:"sni"`      // TLS伪装域名
-	Insecure bool   `yaml:"insecure"` // 是否跳过TLS证书验证（用于自签证书）
+	Insecure bool `yaml:"insecure"` // 跳过TLS证书验证，自签证书时设为true
 
 	// outbound专有
-	Cert          string `yaml:"cert"` // TLS证书路径
-	Key           string `yaml:"key"`  // TLS私钥路径
+	Cert          string `yaml:"cert"`           // TLS证书路径
+	Key           string `yaml:"key"`            // TLS私钥路径
 	PaddingScheme string `yaml:"padding_scheme"` // 自定义PaddingScheme文本
 
 	// Session管理（inbound）
@@ -29,13 +29,14 @@ type Config struct {
 	MinIdleSession           int    `yaml:"min_idle_session"`            // 默认2
 }
 
-// Mode 根据配置字段自动识别运行模式
+// Mode 根据配置字段自动识别运行模式：
+// 有 cert+key 为 outbound，有 remote 为 inbound
 func (c *Config) Mode() string {
-	if c.SNI != "" || c.Insecure {
-		return "inbound"
-	}
 	if c.Cert != "" && c.Key != "" {
 		return "outbound"
+	}
+	if c.Remote != "" {
+		return "inbound"
 	}
 	return "unknown"
 }
@@ -53,13 +54,15 @@ func (c *Config) Validate() error {
 
 	switch c.Mode() {
 	case "inbound":
-		// ok
+		if c.SNI == "" && !c.Insecure {
+			return errors.New("inbound 模式需要配置 sni（TLS伪装域名），自签证书请同时设置 insecure: true")
+		}
 	case "outbound":
 		if c.Cert == "" || c.Key == "" {
 			return errors.New("outbound 模式需要配置 cert 和 key")
 		}
 	default:
-		return errors.New("无法识别运行模式：请配置 sni 或 insecure=true（inbound），或配置 cert+key（outbound）")
+		return errors.New("无法识别运行模式：请配置 remote（inbound）或 cert+key（outbound）")
 	}
 
 	// 默认值
