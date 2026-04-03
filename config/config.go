@@ -7,23 +7,31 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type PaddingConfig struct {
-	Templates []int `yaml:"templates"`
-}
-
+// Config 统一配置结构，通过字段区分inbound/outbound模式
 type Config struct {
-	Listen   string        `yaml:"listen"`
-	Remote   string        `yaml:"remote"`
-	SNI      string        `yaml:"sni"`      // inbound专有：TLS伪装域名
-	Cert     string        `yaml:"cert"`     // outbound专有：TLS证书
-	Key      string        `yaml:"key"`      // outbound专有：TLS私钥
-	Password string        `yaml:"password"` // 认证密钥
-	Padding  PaddingConfig `yaml:"padding"`
+	// 通用
+	Listen   string `yaml:"listen"`
+	Remote   string `yaml:"remote"`
+	Password string `yaml:"password"`
+
+	// inbound专有
+	SNI      string `yaml:"sni"`      // TLS伪装域名
+	Insecure bool   `yaml:"insecure"` // 是否跳过TLS证书验证（用于自签证书）
+
+	// outbound专有
+	Cert          string `yaml:"cert"` // TLS证书路径
+	Key           string `yaml:"key"`  // TLS私钥路径
+	PaddingScheme string `yaml:"padding_scheme"` // 自定义PaddingScheme文本
+
+	// Session管理（inbound）
+	IdleSessionCheckInterval string `yaml:"idle_session_check_interval"` // 默认30s
+	IdleSessionTimeout       string `yaml:"idle_session_timeout"`        // 默认60s
+	MinIdleSession           int    `yaml:"min_idle_session"`            // 默认2
 }
 
 // Mode 根据配置字段自动识别运行模式
 func (c *Config) Mode() string {
-	if c.SNI != "" {
+	if c.SNI != "" || c.Insecure {
 		return "inbound"
 	}
 	if c.Cert != "" && c.Key != "" {
@@ -39,24 +47,32 @@ func (c *Config) Validate() error {
 	if c.Password == "" {
 		return errors.New("password 不能为空")
 	}
+	if c.Remote == "" {
+		return errors.New("remote 不能为空")
+	}
+
 	switch c.Mode() {
 	case "inbound":
-		if c.Remote == "" {
-			return errors.New("inbound 模式需要配置 remote")
-		}
+		// ok
 	case "outbound":
-		if c.Remote == "" {
-			return errors.New("outbound 模式需要配置 remote")
-		}
 		if c.Cert == "" || c.Key == "" {
 			return errors.New("outbound 模式需要配置 cert 和 key")
 		}
 	default:
-		return errors.New("无法识别运行模式，请配置 sni（inbound）或 cert+key（outbound）")
+		return errors.New("无法识别运行模式：请配置 sni 或 insecure=true（inbound），或配置 cert+key（outbound）")
 	}
-	if len(c.Padding.Templates) == 0 {
-		c.Padding.Templates = []int{64, 128, 256, 512, 1024, 1440, 2048}
+
+	// 默认值
+	if c.MinIdleSession == 0 {
+		c.MinIdleSession = 2
 	}
+	if c.IdleSessionCheckInterval == "" {
+		c.IdleSessionCheckInterval = "30s"
+	}
+	if c.IdleSessionTimeout == "" {
+		c.IdleSessionTimeout = "60s"
+	}
+
 	return nil
 }
 

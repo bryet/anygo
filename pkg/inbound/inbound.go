@@ -1,17 +1,21 @@
 package inbound
 
 import (
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
-	"sync"
 	"time"
 
 	"anygo/config"
-	"anygo/pkg/tunnel"
+	"anygo/pkg/frame"
+	"anygo/pkg/padding"
+	"anygo/pkg/session"
 
 	utls "github.com/refraction-networking/utls"
-	"github.com/xtaci/smux"
 )
 
 const (
@@ -20,35 +24,36 @@ const (
 	dialTimeout        = 10 * time.Second
 )
 
-// Inbound 境内入口节点
-// 职责：接收客户端TCP连接 → 通过AnyTLS加密隧道转发到境外出口
+// Inbound 境内入口节点，扮演AnyTLS客户端角色
 type Inbound struct {
-	cfg     *config.Config
-	session *smux.Session
-	mu      sync.Mutex
-
-	// 断线重连控制
-	reconnecting bool
-	sessionReady chan struct{} // session就绪信号
+	cfg    *config.Config
+	scheme *padding.Scheme
+	pool   *session.Pool
 }
 
 func New(cfg *config.Config) *Inbound {
-	return &Inbound{
-		cfg:          cfg,
-		sessionReady: make(chan struct{}),
+	ib := &Inbound{
+		cfg:    cfg,
+		scheme: padding.Default(),
 	}
+	return ib
 }
 
 func (ib *Inbound) Run() error {
+	// 初始化Session池
+	ib.pool = session.NewPool(
+		ib.dialSession,
+		30*time.Second, // 检查间隔
+		60*time.Second, // 空闲超时
+		2,              // 最少保留2个空闲Session
+	)
+
 	listener, err := net.Listen("tcp", ib.cfg.Listen)
 	if err != nil {
 		return err
 	}
 	log.Printf("[inbound] 监听 %s", ib.cfg.Listen)
 	log.Printf("[inbound] 出口服务器: %s  SNI: %s", ib.cfg.Remote, ib.cfg.SNI)
-
-	// 启动时主动建立session
-	go ib.maintainSession()
 
 	for {
 		conn, err := listener.Accept()
@@ -60,126 +65,118 @@ func (ib *Inbound) Run() error {
 	}
 }
 
-// maintainSession 持续维护到境外服务器的session，断线自动重连
-func (ib *Inbound) maintainSession() {
-	delay := reconnectBaseDelay
-
-	for {
-		log.Printf("[inbound] 正在连接出口服务器 %s ...", ib.cfg.Remote)
-
-		session, err := ib.dial()
-		if err != nil {
-			log.Printf("[inbound] 连接失败: %v，%v 后重试", err, delay)
-			time.Sleep(delay)
-			delay = min(delay*2, reconnectMaxDelay)
-			continue
-		}
-
-		// 连接成功，重置延迟
-		delay = reconnectBaseDelay
-		log.Println("[inbound] 隧道连接成功")
-
-		ib.mu.Lock()
-		ib.session = session
-		// 通知等待中的goroutine session已就绪
-		close(ib.sessionReady)
-		ib.sessionReady = make(chan struct{})
-		ib.mu.Unlock()
-
-		// 等待session关闭
-		ib.waitSessionClosed(session)
-		log.Println("[inbound] 隧道断开，准备重连...")
+// dialSession 新建一个到出口服务器的ClientSession（注入到Pool）
+func (ib *Inbound) dialSession() (*session.ClientSession, error) {
+	conn, err := ib.dialTLS()
+	if err != nil {
+		return nil, err
 	}
+
+	// 发送认证包：sha256(password) + padding0
+	if err := ib.sendAuth(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("auth failed: %w", err)
+	}
+
+	// 建立ClientSession（内部发送cmdSettings）
+	cs, err := session.NewClientSession(conn, ib.cfg.Password, ib.scheme)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("session handshake failed: %w", err)
+	}
+
+	return cs, nil
 }
 
-// dial 建立TLS连接并完成认证，返回smux session
-func (ib *Inbound) dial() (*smux.Session, error) {
-	// 1. TCP拨号
+// dialTLS 建立TLS连接，使用uTLS伪装Chrome指纹
+func (ib *Inbound) dialTLS() (net.Conn, error) {
 	tcpConn, err := net.DialTimeout("tcp", ib.cfg.Remote, dialTimeout)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. uTLS握手，伪装成Chrome
+	if ib.cfg.Insecure {
+		// 自签证书：跳过验证，使用标准TLS
+		tlsConfig := &tls.Config{
+			ServerName:         ib.cfg.SNI,
+			InsecureSkipVerify: true,
+		}
+		tlsConn := tls.Client(tcpConn, tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			tcpConn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+
+	// 正式证书：使用uTLS伪装Chrome指纹
 	tlsConfig := &utls.Config{
 		ServerName:         ib.cfg.SNI,
 		InsecureSkipVerify: false,
 	}
 	uConn := utls.UClient(tcpConn, tlsConfig, utls.HelloChrome_Auto)
-	if err := uConn.HandshakeContext(nil); err != nil {
+	if err := uConn.Handshake(); err != nil {
 		tcpConn.Close()
 		return nil, err
 	}
-
-	// 3. 发送认证token
-	token := tunnel.AuthToken(ib.cfg.Password)
-	if _, err := uConn.Write(token); err != nil {
-		uConn.Close()
-		return nil, err
-	}
-
-	// 4. 建立smux客户端session（内含padding层）
-	session, err := tunnel.NewClientSession(uConn, ib.cfg.Padding)
-	if err != nil {
-		uConn.Close()
-		return nil, err
-	}
-
-	return session, nil
+	return uConn, nil
 }
 
-// waitSessionClosed 阻塞直到session关闭
-func (ib *Inbound) waitSessionClosed(session *smux.Session) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		if session.IsClosed() {
-			return
-		}
-	}
+// sendAuth 发送认证包
+func (ib *Inbound) sendAuth(conn net.Conn) error {
+	// sha256(password)
+	h := sha256.Sum256([]byte(ib.cfg.Password))
+
+	// padding0大小由当前scheme决定
+	padding0Size := ib.scheme.Padding0Size()
+	padding0 := padding.RandBytes(padding0Size)
+
+	return frame.WriteAuth(conn, h[:], padding0)
 }
 
-// getSession 获取当前有效的session，若未就绪则等待
-func (ib *Inbound) getSession() (*smux.Session, chan struct{}) {
-	ib.mu.Lock()
-	defer ib.mu.Unlock()
-	return ib.session, ib.sessionReady
-}
-
-// handleConn 处理一个客户端连接
+// handleConn 处理一个客户端TCP连接
 func (ib *Inbound) handleConn(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	// 获取session，若未就绪最多等待10秒
-	session, ready := ib.getSession()
-	if session == nil || session.IsClosed() {
-		select {
-		case <-ready:
-			session, _ = ib.getSession()
-		case <-time.After(10 * time.Second):
-			log.Println("[inbound] 等待隧道超时，丢弃连接")
-			return
-		}
-	}
-
-	// 在session上开一个stream
-	stream, err := session.OpenStream()
+	// 从Pool获取Stream（含Session复用逻辑）
+	stream, cs, err := ib.pool.GetStream()
 	if err != nil {
-		log.Printf("[inbound] 开启stream失败: %v", err)
+		log.Printf("[inbound] 获取stream失败: %v", err)
 		return
 	}
-	defer stream.Close()
+	defer func() {
+		stream.Close()
+		// Stream用完放回Session池
+		ib.pool.ReturnSession(cs)
+	}()
 
-	log.Printf("[inbound] stream #%d 已建立", stream.ID())
+	// 发送目标地址（SocksAddr格式）
+	// 在anygo中，目标地址就是配置的remote（透明转发）
+	target := ib.cfg.Remote
+	if err := writeSocksAddr(stream, target); err != nil {
+		log.Printf("[inbound] 发送目标地址失败: %v", err)
+		return
+	}
 
-	// 双向转发
+	log.Printf("[inbound] stream #%d → %s", stream.ID(), target)
+
+	// 双向中继
 	relay(clientConn, stream)
 }
 
-// relay 双向转发两个连接的数据
+// writeSocksAddr 向stream写入目标地址（简化版：直接写host:port字符串，用2字节长度前缀）
+func writeSocksAddr(w io.Writer, addr string) error {
+	b := []byte(addr)
+	buf := make([]byte, 2+len(b))
+	binary.BigEndian.PutUint16(buf[:2], uint16(len(b)))
+	copy(buf[2:], b)
+	_, err := w.Write(buf)
+	return err
+}
+
+// relay 双向转发
 func relay(a, b io.ReadWriter) {
 	done := make(chan struct{}, 2)
-
 	go func() {
 		io.Copy(a, b)
 		done <- struct{}{}
@@ -188,13 +185,5 @@ func relay(a, b io.ReadWriter) {
 		io.Copy(b, a)
 		done <- struct{}{}
 	}()
-
 	<-done
-}
-
-func min(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }

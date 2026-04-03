@@ -1,43 +1,45 @@
 package outbound
 
 import (
-	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
-	"time"
+	"net/http"
 
 	"anygo/config"
-	"anygo/pkg/tunnel"
-	"github.com/xtaci/smux"
+	"anygo/pkg/frame"
+	"anygo/pkg/padding"
+	"anygo/pkg/session"
 )
 
-const (
-	dialTimeout      = 10 * time.Second
-	maxRetryDelay    = 30 * time.Second
-	baseRetryDelay   = 1 * time.Second
-)
-
-// Outbound 境外出口节点
-// 职责：接受境内节点的TLS连接 → 验证认证 → 解密 → 转发到目标服务器
+// Outbound 境外出口节点，扮演AnyTLS服务端角色
 type Outbound struct {
-	cfg *config.Config
+	cfg    *config.Config
+	scheme *padding.Scheme
 }
 
 func New(cfg *config.Config) *Outbound {
-	return &Outbound{cfg: cfg}
+	scheme := padding.Default()
+	// 如果配置了自定义paddingScheme，使用自定义的
+	if cfg.PaddingScheme != "" {
+		s, err := padding.Parse(cfg.PaddingScheme)
+		if err != nil {
+			log.Printf("[outbound] 无效的paddingScheme配置，使用默认值: %v", err)
+		} else {
+			scheme = s
+		}
+	}
+	return &Outbound{cfg: cfg, scheme: scheme}
 }
 
 func (ob *Outbound) Run() error {
-	cert, err := tls.LoadX509KeyPair(ob.cfg.Cert, ob.cfg.Key)
+	tlsConfig, err := ob.buildTLSConfig()
 	if err != nil {
 		return err
-	}
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
 	}
 
 	listener, err := tls.Listen("tcp", ob.cfg.Listen, tlsConfig)
@@ -47,6 +49,7 @@ func (ob *Outbound) Run() error {
 
 	log.Printf("[outbound] 监听 %s", ob.cfg.Listen)
 	log.Printf("[outbound] 目标服务器: %s", ob.cfg.Remote)
+	log.Printf("[outbound] PaddingScheme md5: %s", ob.scheme.MD5())
 
 	for {
 		conn, err := listener.Accept()
@@ -58,89 +61,117 @@ func (ob *Outbound) Run() error {
 	}
 }
 
-// handleConn 处理一个来自境内节点的连接
+// buildTLSConfig 构建TLS配置，支持自签证书
+func (ob *Outbound) buildTLSConfig() (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(ob.cfg.Cert, ob.cfg.Key)
+	if err != nil {
+		return nil, fmt.Errorf("加载证书失败: %w", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+// handleConn 处理一个来自inbound的连接
 func (ob *Outbound) handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	// 1. 验证认证token（32字节）
-	token := make([]byte, 32)
-	if _, err := io.ReadFull(conn, token); err != nil {
-		log.Printf("[outbound] 读取token失败 from %s: %v", conn.RemoteAddr(), err)
+	// 1. 认证
+	if err := ob.authenticate(conn); err != nil {
+		log.Printf("[outbound] 认证失败 from %s: %v，fallback HTTP", conn.RemoteAddr(), err)
+		ob.fallbackHTTP(conn)
 		return
 	}
-
-	expected := tunnel.AuthToken(ob.cfg.Password)
-	if !bytes.Equal(token, expected) {
-		log.Printf("[outbound] 认证失败 from %s", conn.RemoteAddr())
-		return
-	}
-
 	log.Printf("[outbound] 认证成功: %s", conn.RemoteAddr())
 
-	// 2. 建立smux服务端session（内含padding解析层）
-	session, err := tunnel.NewServerSession(conn, ob.cfg.Padding)
+	// 2. 建立ServerSession（内部等待cmdSettings并完成握手）
+	ss, err := session.NewServerSession(conn, ob.scheme)
 	if err != nil {
-		log.Printf("[outbound] 建立session失败: %v", err)
+		log.Printf("[outbound] session握手失败: %v", err)
 		return
 	}
-	defer session.Close()
 
-	// 3. 循环接受stream
+	// 3. 循环接受Stream
 	for {
-		stream, err := session.AcceptStream()
+		stream, err := ss.AcceptStream()
 		if err != nil {
-			if !session.IsClosed() {
-				log.Printf("[outbound] AcceptStream error: %v", err)
-			}
 			return
 		}
 		go ob.handleStream(stream)
 	}
 }
 
-// handleStream 处理一个smux stream，带断线重连转发到目标服务器
-func (ob *Outbound) handleStream(stream *smux.Stream) {
+// authenticate 验证认证包
+func (ob *Outbound) authenticate(conn net.Conn) error {
+	passwordHash, _, err := frame.ReadAuth(conn)
+	if err != nil {
+		return fmt.Errorf("读取认证包失败: %w", err)
+	}
+
+	expected := sha256.Sum256([]byte(ob.cfg.Password))
+	if !equalBytes(passwordHash, expected[:]) {
+		return fmt.Errorf("密码错误")
+	}
+
+	return nil
+}
+
+// handleStream 处理一个Stream：读目标地址，连接目标，双向中继
+func (ob *Outbound) handleStream(stream *session.Stream) {
 	defer stream.Close()
 
-	// 连接目标服务器，失败自动重试
-	target, err := ob.dialTargetWithRetry()
+	// 读目标地址（2字节长度前缀 + 地址字符串）
+	target, err := readSocksAddr(stream)
 	if err != nil {
-		log.Printf("[outbound] 无法连接目标服务器 %s: %v", ob.cfg.Remote, err)
+		log.Printf("[outbound] 读取目标地址失败: %v", err)
 		return
 	}
-	defer target.Close()
 
-	log.Printf("[outbound] stream #%d → %s", stream.ID(), ob.cfg.Remote)
-
-	// 双向转发
-	relay(stream, target)
-}
-
-// dialTargetWithRetry 带重试的目标服务器拨号
-func (ob *Outbound) dialTargetWithRetry() (net.Conn, error) {
-	delay := baseRetryDelay
-	maxAttempts := 5
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		conn, err := net.DialTimeout("tcp", ob.cfg.Remote, dialTimeout)
-		if err == nil {
-			return conn, nil
-		}
-
-		log.Printf("[outbound] 连接目标服务器失败 (第%d次): %v", attempt, err)
-		if attempt < maxAttempts {
-			time.Sleep(delay)
-			delay = minDuration(delay*2, maxRetryDelay)
-		}
+	// 连接目标服务器
+	targetConn, err := net.Dial("tcp", target)
+	if err != nil {
+		log.Printf("[outbound] 连接目标 %s 失败: %v", target, err)
+		return
 	}
+	defer targetConn.Close()
 
-	return nil, net.ErrClosed
+	log.Printf("[outbound] stream #%d → %s", stream.ID(), target)
+
+	// 双向中继
+	relay(stream, targetConn)
 }
 
-// relay 双向转发两个连接的数据
+// readSocksAddr 读取目标地址（2字节长度前缀 + 地址字符串）
+func readSocksAddr(r io.Reader) (string, error) {
+	lenBuf := make([]byte, 2)
+	if _, err := io.ReadFull(r, lenBuf); err != nil {
+		return "", err
+	}
+	addrLen := binary.BigEndian.Uint16(lenBuf)
+	addrBuf := make([]byte, addrLen)
+	if _, err := io.ReadFull(r, addrBuf); err != nil {
+		return "", err
+	}
+	return string(addrBuf), nil
+}
+
+// fallbackHTTP 认证失败时返回正常HTTP响应（防主动探测）
+func (ob *Outbound) fallbackHTTP(conn net.Conn) {
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Proto:      "HTTP/1.1",
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(nil),
+	}
+	_ = resp
+	// 简单返回一个正常页面
+	conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\nHello, World!"))
+}
+
+// relay 双向转发
 func relay(a, b io.ReadWriter) {
 	done := make(chan struct{}, 2)
-
 	go func() {
 		io.Copy(a, b)
 		done <- struct{}{}
@@ -149,13 +180,16 @@ func relay(a, b io.ReadWriter) {
 		io.Copy(b, a)
 		done <- struct{}{}
 	}()
-
 	<-done
 }
 
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
+func equalBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	return b
+	var diff byte
+	for i := range a {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
 }
