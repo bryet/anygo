@@ -6,7 +6,7 @@ After=network.target
 User=root
 Group=root
 WorkingDirectory=/var/anygo
-ExecStart=/var/anygo/anygo -c /var/anygo/config.ini
+ExecStart=/var/anygo/anygo -config /var/anygo/config.yaml
 Restart=on-failure
 RestartSec=5s
 
