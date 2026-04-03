@@ -1,0 +1,14 @@
+[Unit]
+Description=Anygo Service
+After=network.target
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/var/anygo
+ExecStart=/var/anygo/anygo -c /var/anygo/config.ini
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
