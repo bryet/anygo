@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"anytls-forward/config"
-	"anytls-forward/pkg/tunnel"
+	"config"
+	"pkg/tunnel"
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtaci/smux"
