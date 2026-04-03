@@ -5,8 +5,8 @@ import (
 	"io"
 	"net"
 
-	"config"
-	"pkg/padding"
+	"anygo/config"
+	"anygo/pkg/padding"
 	"github.com/xtaci/smux"
 )
 
