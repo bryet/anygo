@@ -1,7 +1,7 @@
 # 境内入口配置，用户自行区分
 # Session管理（可选）
 idle_session_check_interval: "30s"
-idle_session_timeout: "5s"
+idle_session_timeout: "60s"
 min_idle_session: 2
 
 tunnels:         # 支持多组转发
