@@ -2,81 +2,129 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Config 统一配置结构，通过字段区分inbound/outbound模式
-type Config struct {
-	// 通用
+// TunnelConfig 单条转发规则
+type TunnelConfig struct {
 	Listen   string `yaml:"listen"`
+	Remote   string `yaml:"remote"`
+	SNI      string `yaml:"sni"`
+	Insecure bool   `yaml:"insecure"`
 	Password string `yaml:"password"`
-	SNI      string `yaml:"sni"`    // TLS伪装域名（inbound用于握手，outbound仅日志展示）
-	Remote   string `yaml:"remote"` // inbound: outbound服务器地址；outbound: 最终转发目标地址
-
-	// inbound专有
-	Insecure bool `yaml:"insecure"` // 跳过TLS证书验证，自签证书时设为true
-
-	// outbound专有
-	Cert          string `yaml:"cert"`           // TLS证书路径
-	Key           string `yaml:"key"`            // TLS私钥路径
-	PaddingScheme string `yaml:"padding_scheme"` // 自定义PaddingScheme文本
-
-	// Session管理（inbound）
-	IdleSessionCheckInterval string `yaml:"idle_session_check_interval"` // 默认30s
-	IdleSessionTimeout       string `yaml:"idle_session_timeout"`        // 默认60s
-	MinIdleSession           int    `yaml:"min_idle_session"`            // 默认2
+	Cert     string `yaml:"cert"`
+	Key      string `yaml:"key"`
 }
 
-// Mode 根据配置字段自动识别运行模式：
-// 有 cert+key 为 outbound，有 remote 为 inbound
-func (c *Config) Mode() string {
-	if c.Cert != "" && c.Key != "" {
+// Mode 根据字段自动识别这条规则是 inbound 还是 outbound
+func (t *TunnelConfig) Mode() string {
+	if t.Cert != "" && t.Key != "" {
 		return "outbound"
 	}
-	if c.Remote != "" {
+	if t.Remote != "" {
 		return "inbound"
 	}
 	return "unknown"
 }
 
-func (c *Config) Validate() error {
-	if c.Listen == "" {
-		return errors.New("listen 不能为空")
+func (t *TunnelConfig) Validate(idx int) error {
+	if t.Listen == "" {
+		return fmt.Errorf("tunnels[%d]: listen 不能为空", idx)
 	}
-	if c.Password == "" {
-		return errors.New("password 不能为空")
+	if t.Password == "" {
+		return fmt.Errorf("tunnels[%d]: password 不能为空", idx)
 	}
-	if c.Remote == "" {
-		return errors.New("remote 不能为空")
+	if t.Remote == "" {
+		return fmt.Errorf("tunnels[%d]: remote 不能为空", idx)
 	}
-
-	switch c.Mode() {
+	switch t.Mode() {
 	case "inbound":
-		if c.SNI == "" && !c.Insecure {
-			return errors.New("inbound 模式需要配置 sni（TLS伪装域名），自签证书请同时设置 insecure: true")
+		if t.SNI == "" && !t.Insecure {
+			return fmt.Errorf("tunnels[%d]: inbound 需要配置 sni，或设置 insecure: true", idx)
 		}
 	case "outbound":
-		if c.Cert == "" || c.Key == "" {
-			return errors.New("outbound 模式需要配置 cert 和 key")
-		}
+		// cert/key 已由 Mode() 确认
 	default:
-		return errors.New("无法识别运行模式：请配置 remote（inbound）或 cert+key（outbound）")
+		return fmt.Errorf("tunnels[%d]: 无法识别模式，请配置 remote（inbound）或 cert+key（outbound）", idx)
 	}
+	return nil
+}
 
-	// 默认值
-	if c.MinIdleSession == 0 {
-		c.MinIdleSession = 2
-	}
+// Config 顶层配置，包含全局参数和多条转发规则
+type Config struct {
+	// 全局参数（inbound用）
+	IdleSessionCheckInterval string `yaml:"idle_session_check_interval"`
+	IdleSessionTimeout       string `yaml:"idle_session_timeout"`
+	MinIdleSession           int    `yaml:"min_idle_session"`
+
+	// 全局参数（outbound用）
+	PaddingScheme string `yaml:"padding_scheme"`
+
+	// 多条转发规则
+	Tunnels []TunnelConfig `yaml:"tunnels"`
+}
+
+func (c *Config) applyDefaults() {
 	if c.IdleSessionCheckInterval == "" {
 		c.IdleSessionCheckInterval = "30s"
 	}
 	if c.IdleSessionTimeout == "" {
 		c.IdleSessionTimeout = "60s"
 	}
+	if c.MinIdleSession == 0 {
+		c.MinIdleSession = 2
+	}
+}
+
+func (c *Config) Validate() error {
+	if len(c.Tunnels) == 0 {
+		return errors.New("至少需要配置一条 tunnels 规则")
+	}
+
+	// 所有 tunnel 必须是同一模式（不能混用 inbound 和 outbound）
+	mode := c.Tunnels[0].Mode()
+	for i, t := range c.Tunnels {
+		if err := t.Validate(i); err != nil {
+			return err
+		}
+		if t.Mode() != mode {
+			return fmt.Errorf("tunnels[%d]: 不能混用 inbound 和 outbound 规则", i)
+		}
+	}
 
 	return nil
+}
+
+// Mode 返回整体运行模式（由第一条 tunnel 决定）
+func (c *Config) Mode() string {
+	if len(c.Tunnels) == 0 {
+		return "unknown"
+	}
+	return c.Tunnels[0].Mode()
+}
+
+// ToTunnelConfig 兼容旧的单条配置接口，把全局参数合并进单条 TunnelConfig
+// inbound/outbound 的 New() 函数仍然接收单条配置
+func (c *Config) MergeInto(t *TunnelConfig) *MergedConfig {
+	return &MergedConfig{
+		TunnelConfig:             *t,
+		IdleSessionCheckInterval: c.IdleSessionCheckInterval,
+		IdleSessionTimeout:       c.IdleSessionTimeout,
+		MinIdleSession:           c.MinIdleSession,
+		PaddingScheme:            c.PaddingScheme,
+	}
+}
+
+// MergedConfig 单条规则 + 全局参数，传给 inbound.New() / outbound.New()
+type MergedConfig struct {
+	TunnelConfig
+	IdleSessionCheckInterval string
+	IdleSessionTimeout       string
+	MinIdleSession           int
+	PaddingScheme            string
 }
 
 func Load(path string) (*Config, error) {
@@ -88,6 +136,7 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
+	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
