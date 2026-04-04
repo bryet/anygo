@@ -16,16 +16,16 @@ import (
 
 // Outbound 境外出口节点，扮演AnyTLS服务端角色
 type Outbound struct {
-	cfg    *config.Config
+	cfg    *config.MergedConfig
 	scheme *padding.Scheme
 }
 
-func New(cfg *config.Config) *Outbound {
+func New(cfg *config.MergedConfig) *Outbound {
 	scheme := padding.Default()
 	if cfg.PaddingScheme != "" {
 		s, err := padding.Parse(cfg.PaddingScheme)
 		if err != nil {
-			log.Printf("[outbound] 无效的paddingScheme配置，使用默认值: %v", err)
+			log.Printf("[outbound] 无效的paddingScheme，使用默认值: %v", err)
 		} else {
 			scheme = s
 		}
@@ -44,15 +44,12 @@ func (ob *Outbound) Run() error {
 		return err
 	}
 
-	log.Printf("[outbound] 监听 %s", ob.cfg.Listen)
-	log.Printf("[outbound] SNI: %s", ob.cfg.SNI)
-	log.Printf("[outbound] 转发目标: %s", ob.cfg.Remote)
-	log.Printf("[outbound] PaddingScheme md5: %s", ob.scheme.MD5())
+	log.Printf("[outbound] 监听 %s → %s  padding_md5=%s", ob.cfg.Listen, ob.cfg.Remote, ob.scheme.MD5())
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("[outbound] accept error:", err)
+			log.Printf("[outbound:%s] accept error: %v", ob.cfg.Listen, err)
 			continue
 		}
 		go ob.handleConn(conn)
@@ -74,15 +71,15 @@ func (ob *Outbound) handleConn(conn net.Conn) {
 	defer conn.Close()
 
 	if err := ob.authenticate(conn); err != nil {
-		log.Printf("[outbound] 认证失败 from %s: %v，fallback HTTP", conn.RemoteAddr(), err)
+		log.Printf("[outbound:%s] 认证失败 from %s: %v，fallback HTTP", ob.cfg.Listen, conn.RemoteAddr(), err)
 		ob.fallbackHTTP(conn)
 		return
 	}
-	log.Printf("[outbound] 认证成功: %s", conn.RemoteAddr())
+	log.Printf("[outbound:%s] 认证成功: %s", ob.cfg.Listen, conn.RemoteAddr())
 
 	ss, err := session.NewServerSession(conn, ob.scheme)
 	if err != nil {
-		log.Printf("[outbound] session握手失败: %v", err)
+		log.Printf("[outbound:%s] session握手失败: %v", ob.cfg.Listen, err)
 		return
 	}
 
@@ -112,12 +109,12 @@ func (ob *Outbound) handleStream(stream *session.Stream) {
 
 	targetConn, err := net.Dial("tcp", ob.cfg.Remote)
 	if err != nil {
-		log.Printf("[outbound] 连接目标 %s 失败: %v", ob.cfg.Remote, err)
+		log.Printf("[outbound:%s] 连接目标 %s 失败: %v", ob.cfg.Listen, ob.cfg.Remote, err)
 		return
 	}
 	defer targetConn.Close()
 
-	log.Printf("[outbound] stream #%d → %s", stream.ID(), ob.cfg.Remote)
+	log.Printf("[outbound:%s] stream #%d → %s", ob.cfg.Listen, stream.ID(), ob.cfg.Remote)
 	relay(stream, targetConn)
 }
 
