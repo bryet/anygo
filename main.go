@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"sync"
 
 	"anygo/config"
 	"anygo/pkg/inbound"
@@ -30,19 +31,40 @@ func main() {
 		log.Fatalf("加载配置失败: %v", err)
 	}
 
-	switch cfg.Mode() {
-	case "inbound":
-		log.Printf("=== anygo v%s | inbound（境内入口）===", version)
-		ib := inbound.New(cfg)
-		if err := ib.Run(); err != nil {
-			log.Fatal(err)
-		}
+	log.Printf("=== anygo v%s | 模式: %s | 规则数: %d ===", version, cfg.Mode(), len(cfg.Tunnels))
 
-	case "outbound":
-		log.Printf("=== anygo v%s | outbound（境外出口）===", version)
-		ob := outbound.New(cfg)
-		if err := ob.Run(); err != nil {
-			log.Fatal(err)
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(cfg.Tunnels))
+
+	for i := range cfg.Tunnels {
+		merged := cfg.MergeInto(&cfg.Tunnels[i])
+		wg.Add(1)
+
+		switch cfg.Mode() {
+		case "inbound":
+			go func(m *config.MergedConfig) {
+				defer wg.Done()
+				if err := inbound.New(m).Run(); err != nil {
+					errCh <- err
+				}
+			}(merged)
+
+		case "outbound":
+			go func(m *config.MergedConfig) {
+				defer wg.Done()
+				if err := outbound.New(m).Run(); err != nil {
+					errCh <- err
+				}
+			}(merged)
 		}
 	}
+
+	// 任意一个tunnel出错则打印并退出
+	go func() {
+		for err := range errCh {
+			log.Printf("tunnel error: %v", err)
+		}
+	}()
+
+	wg.Wait()
 }
