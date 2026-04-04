@@ -17,20 +17,16 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-const (
-	reconnectBaseDelay = 1 * time.Second
-	reconnectMaxDelay  = 30 * time.Second
-	dialTimeout        = 10 * time.Second
-)
+const dialTimeout = 10 * time.Second
 
 // Inbound 境内入口节点，扮演AnyTLS客户端角色
 type Inbound struct {
-	cfg    *config.Config
+	cfg    *config.MergedConfig
 	scheme *padding.Scheme
 	pool   *session.Pool
 }
 
-func New(cfg *config.Config) *Inbound {
+func New(cfg *config.MergedConfig) *Inbound {
 	return &Inbound{
 		cfg:    cfg,
 		scheme: padding.Default(),
@@ -38,24 +34,32 @@ func New(cfg *config.Config) *Inbound {
 }
 
 func (ib *Inbound) Run() error {
+	checkInterval, err := time.ParseDuration(ib.cfg.IdleSessionCheckInterval)
+	if err != nil {
+		checkInterval = 30 * time.Second
+	}
+	idleTimeout, err := time.ParseDuration(ib.cfg.IdleSessionTimeout)
+	if err != nil {
+		idleTimeout = 60 * time.Second
+	}
+
 	ib.pool = session.NewPool(
 		ib.dialSession,
-		30*time.Second,
-		60*time.Second,
-		2,
+		checkInterval,
+		idleTimeout,
+		ib.cfg.MinIdleSession,
 	)
 
 	listener, err := net.Listen("tcp", ib.cfg.Listen)
 	if err != nil {
 		return err
 	}
-	log.Printf("[inbound] 监听 %s", ib.cfg.Listen)
-	log.Printf("[inbound] 出口服务器: %s  SNI: %s  insecure: %v", ib.cfg.Remote, ib.cfg.SNI, ib.cfg.Insecure)
+	log.Printf("[inbound] 监听 %s → %s  sni=%s insecure=%v", ib.cfg.Listen, ib.cfg.Remote, ib.cfg.SNI, ib.cfg.Insecure)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("[inbound] accept error:", err)
+			log.Printf("[inbound:%s] accept error: %v", ib.cfg.Listen, err)
 			continue
 		}
 		go ib.handleConn(conn)
@@ -80,9 +84,7 @@ func (ib *Inbound) dialSession() (*session.ClientSession, error) {
 }
 
 // dialTLS 建立TLS连接：
-//   - 有 SNI：始终使用 uTLS 伪装 Chrome 指纹；insecure 控制是否验证证书
-//     - insecure=false（真实域名证书）：正常验证
-//     - insecure=true（自签证书）：跳过验证
+//   - 有 SNI：使用 uTLS 伪装 Chrome 指纹；insecure 控制是否验证证书
 //   - 无 SNI + insecure=true：自签证书且无需指纹伪装，使用标准 Go TLS
 func (ib *Inbound) dialTLS() (net.Conn, error) {
 	tcpConn, err := net.DialTimeout("tcp", ib.cfg.Remote, dialTimeout)
@@ -91,7 +93,6 @@ func (ib *Inbound) dialTLS() (net.Conn, error) {
 	}
 
 	if ib.cfg.SNI != "" {
-		// 有 SNI：使用 uTLS 伪装 Chrome 指纹
 		tlsConfig := &utls.Config{
 			ServerName:         ib.cfg.SNI,
 			InsecureSkipVerify: ib.cfg.Insecure,
@@ -105,9 +106,7 @@ func (ib *Inbound) dialTLS() (net.Conn, error) {
 	}
 
 	// 无 SNI：标准 Go TLS，跳过证书验证
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-	}
+	tlsConfig := &tls.Config{InsecureSkipVerify: true}
 	tlsConn := tls.Client(tcpConn, tlsConfig)
 	if err := tlsConn.Handshake(); err != nil {
 		tcpConn.Close()
@@ -127,7 +126,7 @@ func (ib *Inbound) handleConn(clientConn net.Conn) {
 
 	stream, cs, err := ib.pool.GetStream()
 	if err != nil {
-		log.Printf("[inbound] 获取stream失败: %v", err)
+		log.Printf("[inbound:%s] 获取stream失败: %v", ib.cfg.Listen, err)
 		return
 	}
 	defer func() {
@@ -135,7 +134,7 @@ func (ib *Inbound) handleConn(clientConn net.Conn) {
 		ib.pool.ReturnSession(cs)
 	}()
 
-	log.Printf("[inbound] stream #%d 已建立", stream.ID())
+	log.Printf("[inbound:%s] stream #%d 已建立", ib.cfg.Listen, stream.ID())
 	relay(clientConn, stream)
 }
 
