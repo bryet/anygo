@@ -138,6 +138,7 @@ func (ib *Inbound) handleConn(clientConn net.Conn) {
 	relay(clientConn, stream)
 }
 
+// relay 双向转发，等待两个方向都结束后再返回
 func relay(a, b io.ReadWriter) {
 	done := make(chan struct{}, 2)
 	go func() {
@@ -148,5 +149,6 @@ func relay(a, b io.ReadWriter) {
 		io.Copy(b, a)
 		done <- struct{}{}
 	}()
+	<-done
 	<-done
 }

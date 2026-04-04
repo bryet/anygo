@@ -1,11 +1,14 @@
 package session
 
 import (
+	"fmt"
 	"log"
 	"sort"
 	"sync"
 	"time"
 )
+
+const maxGetStreamRetries = 3
 
 // Pool 客户端空闲Session池
 // 策略：优先复用最新（Seq最大）的Session，优先清理最老的Session
@@ -14,18 +17,15 @@ type Pool struct {
 	sessions []*ClientSession
 	nextSeq  uint64
 
-	// 配置
 	checkInterval  time.Duration
 	idleTimeout    time.Duration
 	minIdleSession int
 
-	// 新建Session的工厂函数（由inbound注入）
 	dial func() (*ClientSession, error)
 
 	done chan struct{}
 }
 
-// NewPool 创建Session池
 func NewPool(
 	dial func() (*ClientSession, error),
 	checkInterval time.Duration,
@@ -44,7 +44,20 @@ func NewPool(
 }
 
 // GetStream 获取一个可用的Stream：优先从空闲Session中复用，否则新建Session
+// 修复：改为循环重试，避免原来递归调用可能导致的栈溢出
 func (p *Pool) GetStream() (*Stream, *ClientSession, error) {
+	for attempt := 0; attempt < maxGetStreamRetries; attempt++ {
+		stream, cs, err := p.tryGetStream()
+		if err == nil {
+			return stream, cs, nil
+		}
+		log.Printf("[pool] GetStream attempt %d failed: %v", attempt+1, err)
+	}
+	return nil, nil, fmt.Errorf("获取stream失败，已重试%d次", maxGetStreamRetries)
+}
+
+// tryGetStream 单次尝试获取Stream
+func (p *Pool) tryGetStream() (*Stream, *ClientSession, error) {
 	p.mu.Lock()
 
 	// 找Seq最大的空闲Session
@@ -64,15 +77,14 @@ func (p *Pool) GetStream() (*Stream, *ClientSession, error) {
 
 	if best != nil {
 		best.SetBusy()
-		// 从空闲列表移除（它现在是busy状态）
 		p.sessions = append(p.sessions[:bestIdx], p.sessions[bestIdx+1:]...)
 		p.mu.Unlock()
 
 		stream, err := best.OpenStream()
 		if err != nil {
-			// stream失败，Session可能已坏
+			// Session已失效，关闭它，下次会新建
 			best.close(err)
-			return p.GetStream() // 递归重试
+			return nil, nil, err
 		}
 		return stream, best, nil
 	}
@@ -141,7 +153,6 @@ func (p *Pool) cleanup() {
 	now := time.Now()
 	var alive []*ClientSession
 
-	// 先过滤掉已关闭的
 	for _, cs := range p.sessions {
 		if !cs.IsClosed() {
 			alive = append(alive, cs)
@@ -155,12 +166,10 @@ func (p *Pool) cleanup() {
 
 	var kept []*ClientSession
 	for i, cs := range alive {
-		// 保留前minIdleSession个不清理
 		if i < p.minIdleSession {
 			kept = append(kept, cs)
 			continue
 		}
-		// 超过idleTimeout的清理掉
 		if now.Sub(cs.IdleSince()) > p.idleTimeout {
 			log.Printf("[pool] closing idle session seq=%d (idle %v)", cs.seq, now.Sub(cs.IdleSince()))
 			cs.close(nil)

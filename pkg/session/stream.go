@@ -7,7 +7,6 @@ import (
 	"time"
 )
 
-// streamState Stream状态
 type streamState int
 
 const (
@@ -20,7 +19,6 @@ type Stream struct {
 	id      uint32
 	session *Session
 
-	// 读缓冲：服务端收到的cmdPSH数据放这里
 	readBuf  []byte
 	readMu   sync.Mutex
 	readCond *sync.Cond
@@ -30,8 +28,8 @@ type Stream struct {
 
 	readDeadline  time.Time
 	writeDeadline time.Time
+	deadlineMu    sync.RWMutex
 
-	// 通知Stream已关闭
 	closeCh chan struct{}
 	once    sync.Once
 }
@@ -51,7 +49,6 @@ func (s *Stream) ID() uint32 {
 	return s.id
 }
 
-// pushData 将收到的cmdPSH数据放入读缓冲（由Session调用）
 func (s *Stream) pushData(data []byte) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
@@ -60,31 +57,66 @@ func (s *Stream) pushData(data []byte) {
 }
 
 // Read 实现net.Conn
+// timer 在循环外只创建一次并复用，避免每次 Wait 被唤醒后重新分配
 func (s *Stream) Read(buf []byte) (int, error) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
+	// 在循环外创建 timer，避免重复分配
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
 	for {
+		// 有数据直接返回
 		if len(s.readBuf) > 0 {
 			n := copy(buf, s.readBuf)
 			s.readBuf = s.readBuf[n:]
 			return n, nil
 		}
 
+		// 检查是否关闭
 		s.stateMu.Lock()
 		closed := s.state == streamClosed
 		s.stateMu.Unlock()
-
 		if closed {
 			return 0, io.EOF
 		}
 
-		// 检查deadline
-		if !s.readDeadline.IsZero() && time.Now().After(s.readDeadline) {
-			return 0, &timeoutError{}
-		}
+		// 检查 deadline
+		s.deadlineMu.RLock()
+		deadline := s.readDeadline
+		s.deadlineMu.RUnlock()
 
-		s.readCond.Wait()
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return 0, &timeoutError{}
+			}
+			// 复用 timer：第一次创建，后续 Reset
+			if timer == nil {
+				timer = time.AfterFunc(remaining, func() {
+					s.readCond.Signal()
+				})
+			} else {
+				timer.Reset(remaining)
+			}
+			s.readCond.Wait()
+			// 被唤醒后再次检查 deadline
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				return 0, &timeoutError{}
+			}
+		} else {
+			// 无 deadline，停掉旧 timer 避免误触发
+			if timer != nil {
+				timer.Stop()
+				timer = nil
+			}
+			s.readCond.Wait()
+		}
 	}
 }
 
@@ -110,14 +142,11 @@ func (s *Stream) Close() error {
 		s.state = streamClosed
 		s.stateMu.Unlock()
 
-		// 唤醒阻塞的Read
 		s.readMu.Lock()
 		s.readCond.Signal()
 		s.readMu.Unlock()
 
-		// 通知Session发送cmdFIN
 		s.session.closeStream(s.id)
-
 		close(s.closeCh)
 	})
 	return nil
@@ -142,22 +171,33 @@ func (s *Stream) LocalAddr() net.Addr  { return s.session.conn.LocalAddr() }
 func (s *Stream) RemoteAddr() net.Addr { return s.session.conn.RemoteAddr() }
 
 func (s *Stream) SetDeadline(t time.Time) error {
+	s.deadlineMu.Lock()
 	s.readDeadline = t
 	s.writeDeadline = t
+	s.deadlineMu.Unlock()
+	if !t.IsZero() && time.Now().After(t) {
+		s.readCond.Signal()
+	}
 	return nil
 }
 
 func (s *Stream) SetReadDeadline(t time.Time) error {
+	s.deadlineMu.Lock()
 	s.readDeadline = t
+	s.deadlineMu.Unlock()
+	if !t.IsZero() && time.Now().After(t) {
+		s.readCond.Signal()
+	}
 	return nil
 }
 
 func (s *Stream) SetWriteDeadline(t time.Time) error {
+	s.deadlineMu.Lock()
 	s.writeDeadline = t
+	s.deadlineMu.Unlock()
 	return nil
 }
 
-// timeoutError 超时错误
 type timeoutError struct{}
 
 func (e *timeoutError) Error() string   { return "deadline exceeded" }

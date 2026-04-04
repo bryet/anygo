@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"anygo/config"
 	"anygo/pkg/frame"
@@ -118,10 +119,25 @@ func (ob *Outbound) handleStream(stream *session.Stream) {
 	relay(stream, targetConn)
 }
 
+// fallbackHTTP 认证失败时返回仿 nginx 的 HTTP 响应，防止主动探测识别
 func (ob *Outbound) fallbackHTTP(conn net.Conn) {
-	conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\nHello, World!"))
+	now := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+	resp := "HTTP/1.1 200 OK\r\n" +
+		"Server: nginx/1.24.0\r\n" +
+		"Date: " + now + "\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"Content-Length: 615\r\n" +
+		"Connection: keep-alive\r\n" +
+		"\r\n" +
+		"<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>\n" +
+		"<style>body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;}</style>\n" +
+		"</head>\n<body>\n<h1>Welcome to nginx!</h1>\n" +
+		"<p>If you see this page, the nginx web server is successfully installed and working.</p>\n" +
+		"<p><em>Thank you for using nginx.</em></p>\n</body>\n</html>\n"
+	conn.Write([]byte(resp))
 }
 
+// relay 双向转发，等待两个方向都结束后再返回
 func relay(a, b io.ReadWriter) {
 	done := make(chan struct{}, 2)
 	go func() {
@@ -132,6 +148,7 @@ func relay(a, b io.ReadWriter) {
 		io.Copy(b, a)
 		done <- struct{}{}
 	}()
+	<-done
 	<-done
 }
 

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -11,7 +12,7 @@ import (
 // TunnelConfig 单条转发规则
 type TunnelConfig struct {
 	Listen   string `yaml:"listen"`
-	Remote   string `yaml:"remote"`   // TCP和UDP隧道共用同一目标
+	Remote   string `yaml:"remote"` // TCP和UDP隧道共用同一目标
 	SNI      string `yaml:"sni"`
 	Insecure bool   `yaml:"insecure"`
 	Password string `yaml:"password"`
@@ -33,11 +34,17 @@ func (t *TunnelConfig) Validate(idx int) error {
 	if t.Listen == "" {
 		return fmt.Errorf("tunnels[%d]: listen 不能为空", idx)
 	}
+	if _, _, err := net.SplitHostPort(t.Listen); err != nil {
+		return fmt.Errorf("tunnels[%d]: listen 格式错误，应为 host:port: %w", idx, err)
+	}
 	if t.Password == "" {
 		return fmt.Errorf("tunnels[%d]: password 不能为空", idx)
 	}
 	if t.Remote == "" {
 		return fmt.Errorf("tunnels[%d]: remote 不能为空", idx)
+	}
+	if _, _, err := net.SplitHostPort(t.Remote); err != nil {
+		return fmt.Errorf("tunnels[%d]: remote 格式错误，应为 host:port: %w", idx, err)
 	}
 	switch t.Mode() {
 	case "inbound":
