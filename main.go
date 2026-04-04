@@ -9,6 +9,7 @@ import (
 	"anygo/config"
 	"anygo/pkg/inbound"
 	"anygo/pkg/outbound"
+	"anygo/pkg/quic"
 )
 
 const version = "0.1.0"
@@ -34,14 +35,15 @@ func main() {
 	log.Printf("=== anygo v%s | 模式: %s | 规则数: %d ===", version, cfg.Mode(), len(cfg.Tunnels))
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, len(cfg.Tunnels))
+	errCh := make(chan error, len(cfg.Tunnels)*2)
 
 	for i := range cfg.Tunnels {
 		merged := cfg.MergeInto(&cfg.Tunnels[i])
-		wg.Add(1)
 
 		switch cfg.Mode() {
 		case "inbound":
+			// TCP隧道
+			wg.Add(1)
 			go func(m *config.MergedConfig) {
 				defer wg.Done()
 				if err := inbound.New(m).Run(); err != nil {
@@ -49,17 +51,36 @@ func main() {
 				}
 			}(merged)
 
+			// UDP/QUIC隧道
+			wg.Add(1)
+			go func(m *config.MergedConfig) {
+				defer wg.Done()
+				if err := quic.NewInbound(m).Run(); err != nil {
+					errCh <- err
+				}
+			}(merged)
+
 		case "outbound":
+			// TCP隧道
+			wg.Add(1)
 			go func(m *config.MergedConfig) {
 				defer wg.Done()
 				if err := outbound.New(m).Run(); err != nil {
 					errCh <- err
 				}
 			}(merged)
+
+			// UDP/QUIC隧道
+			wg.Add(1)
+			go func(m *config.MergedConfig) {
+				defer wg.Done()
+				if err := quic.NewOutbound(m).Run(); err != nil {
+					errCh <- err
+				}
+			}(merged)
 		}
 	}
 
-	// 任意一个tunnel出错则打印并退出
 	go func() {
 		for err := range errCh {
 			log.Printf("tunnel error: %v", err)

@@ -323,6 +323,10 @@ func NewClientSession(conn net.Conn, password string, scheme *padding.Scheme) (*
 		return nil, err
 	}
 
+	// cmdSettings 占用了包1的计数（与首个cmdSYN+cmdPSH合并为包1）
+	// 因此后续 writeData 从包2开始计，与协议定义一致
+	cs.pktCounter = 1
+
 	go cs.recvLoop()
 	go cs.heartbeatLoop()
 

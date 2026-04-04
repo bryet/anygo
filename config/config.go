@@ -11,7 +11,7 @@ import (
 // TunnelConfig 单条转发规则
 type TunnelConfig struct {
 	Listen   string `yaml:"listen"`
-	Remote   string `yaml:"remote"`
+	Remote   string `yaml:"remote"`   // TCP和UDP隧道共用同一目标
 	SNI      string `yaml:"sni"`
 	Insecure bool   `yaml:"insecure"`
 	Password string `yaml:"password"`
@@ -19,7 +19,6 @@ type TunnelConfig struct {
 	Key      string `yaml:"key"`
 }
 
-// Mode 根据字段自动识别这条规则是 inbound 还是 outbound
 func (t *TunnelConfig) Mode() string {
 	if t.Cert != "" && t.Key != "" {
 		return "outbound"
@@ -48,12 +47,12 @@ func (t *TunnelConfig) Validate(idx int) error {
 	case "outbound":
 		// cert/key 已由 Mode() 确认
 	default:
-		return fmt.Errorf("tunnels[%d]: 无法识别模式，请配置 remote（inbound）或 cert+key（outbound）", idx)
+		return fmt.Errorf("tunnels[%d]: 无法识别模式", idx)
 	}
 	return nil
 }
 
-// Config 顶层配置，包含全局参数和多条转发规则
+// Config 顶层配置
 type Config struct {
 	// 全局参数（inbound用）
 	IdleSessionCheckInterval string `yaml:"idle_session_check_interval"`
@@ -83,8 +82,6 @@ func (c *Config) Validate() error {
 	if len(c.Tunnels) == 0 {
 		return errors.New("至少需要配置一条 tunnels 规则")
 	}
-
-	// 所有 tunnel 必须是同一模式（不能混用 inbound 和 outbound）
 	mode := c.Tunnels[0].Mode()
 	for i, t := range c.Tunnels {
 		if err := t.Validate(i); err != nil {
@@ -94,11 +91,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("tunnels[%d]: 不能混用 inbound 和 outbound 规则", i)
 		}
 	}
-
 	return nil
 }
 
-// Mode 返回整体运行模式（由第一条 tunnel 决定）
 func (c *Config) Mode() string {
 	if len(c.Tunnels) == 0 {
 		return "unknown"
@@ -106,8 +101,15 @@ func (c *Config) Mode() string {
 	return c.Tunnels[0].Mode()
 }
 
-// ToTunnelConfig 兼容旧的单条配置接口，把全局参数合并进单条 TunnelConfig
-// inbound/outbound 的 New() 函数仍然接收单条配置
+// MergedConfig 单条规则 + 全局参数
+type MergedConfig struct {
+	TunnelConfig
+	IdleSessionCheckInterval string
+	IdleSessionTimeout       string
+	MinIdleSession           int
+	PaddingScheme            string
+}
+
 func (c *Config) MergeInto(t *TunnelConfig) *MergedConfig {
 	return &MergedConfig{
 		TunnelConfig:             *t,
@@ -116,15 +118,6 @@ func (c *Config) MergeInto(t *TunnelConfig) *MergedConfig {
 		MinIdleSession:           c.MinIdleSession,
 		PaddingScheme:            c.PaddingScheme,
 	}
-}
-
-// MergedConfig 单条规则 + 全局参数，传给 inbound.New() / outbound.New()
-type MergedConfig struct {
-	TunnelConfig
-	IdleSessionCheckInterval string
-	IdleSessionTimeout       string
-	MinIdleSession           int
-	PaddingScheme            string
 }
 
 func Load(path string) (*Config, error) {
