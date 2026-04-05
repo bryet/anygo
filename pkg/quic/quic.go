@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -80,7 +79,6 @@ type Inbound struct {
 	conn   *quicgo.Conn
 	connMu sync.RWMutex
 
-	// singleflight：重建连接期间，后续请求等待同一次结果
 	dialMu  sync.Mutex
 	dialing *dialCall
 }
@@ -115,29 +113,21 @@ func (ib *Inbound) Run() error {
 	}
 }
 
-// getQUICConn 获取或重建QUIC连接
-// 快路径：RWMutex 读锁，连接有效直接返回，无阻塞
-// 慢路径：singleflight 保证同一时刻只有一个 goroutine 做重建，
-//
-//	其余 goroutine 等待同一次重建结果，不会全部串行等锁
+// getQUICConn 快路径用读锁，慢路径用 singleflight 避免重复建连
 func (ib *Inbound) getQUICConn() (*quicgo.Conn, error) {
-	// 快路径
 	ib.connMu.RLock()
 	conn := ib.conn
 	ib.connMu.RUnlock()
 	if conn != nil {
 		select {
 		case <-conn.Context().Done():
-			// 连接失效，走慢路径
 		default:
 			return conn, nil
 		}
 	}
 
-	// 慢路径：singleflight
 	ib.dialMu.Lock()
 	if ib.dialing != nil {
-		// 已有 goroutine 在重建，等它完成
 		call := ib.dialing
 		ib.dialMu.Unlock()
 		call.wg.Wait()
@@ -158,7 +148,6 @@ func (ib *Inbound) getQUICConn() (*quicgo.Conn, error) {
 	return call.val, call.err
 }
 
-// dialQUIC 建立新的QUIC连接并完成认证，成功后写入 ib.conn
 func (ib *Inbound) dialQUIC() (*quicgo.Conn, error) {
 	tlsCfg := &tls.Config{
 		InsecureSkipVerify: ib.cfg.Insecure,
@@ -200,7 +189,6 @@ func (ib *Inbound) dialQUIC() (*quicgo.Conn, error) {
 	return qconn, nil
 }
 
-// handlePacket 每个UDP包对应一个QUIC stream，一问一答后由defer关闭
 func (ib *Inbound) handlePacket(localConn *net.UDPConn, clientAddr *net.UDPAddr, data []byte) {
 	qconn, err := ib.getQUICConn()
 	if err != nil {
@@ -246,9 +234,8 @@ func (ib *Inbound) handlePacket(localConn *net.UDPConn, clientAddr *net.UDPAddr,
 // ─────────────────────────────────────────────────
 
 type Outbound struct {
-	cfg     *config.MergedConfig
-	udpConn *net.UDPConn // 复用的共享 UDPConn，避免每个 stream 新建 socket
-	udpMu   sync.Mutex
+	cfg        *config.MergedConfig
+	targetAddr *net.UDPAddr // 预解析，避免每个 stream 重复 DNS 解析
 }
 
 func NewOutbound(cfg *config.MergedConfig) *Outbound {
@@ -256,6 +243,13 @@ func NewOutbound(cfg *config.MergedConfig) *Outbound {
 }
 
 func (ob *Outbound) Run() error {
+	// 启动时预解析目标地址
+	targetAddr, err := net.ResolveUDPAddr("udp", ob.cfg.Remote)
+	if err != nil {
+		return err
+	}
+	ob.targetAddr = targetAddr
+
 	cert, err := tls.LoadX509KeyPair(ob.cfg.Cert, ob.cfg.Key)
 	if err != nil {
 		return err
@@ -275,12 +269,6 @@ func (ob *Outbound) Run() error {
 	}
 	defer listener.Close()
 
-	// 预先建立共享 UDPConn
-	if err := ob.initUDPConn(); err != nil {
-		return err
-	}
-	defer ob.udpConn.Close()
-
 	log.Printf("[quic-outbound] QUIC监听 %s → %s", ob.cfg.Listen, ob.cfg.Remote)
 
 	for {
@@ -291,19 +279,6 @@ func (ob *Outbound) Run() error {
 		}
 		go ob.handleConn(conn)
 	}
-}
-
-func (ob *Outbound) initUDPConn() error {
-	targetAddr, err := net.ResolveUDPAddr("udp", ob.cfg.Remote)
-	if err != nil {
-		return fmt.Errorf("解析目标地址失败: %w", err)
-	}
-	udpConn, err := net.DialUDP("udp", nil, targetAddr)
-	if err != nil {
-		return fmt.Errorf("创建UDP连接失败: %w", err)
-	}
-	ob.udpConn = udpConn
-	return nil
 }
 
 func (ob *Outbound) handleConn(conn *quicgo.Conn) {
@@ -337,9 +312,8 @@ func (ob *Outbound) handleConn(conn *quicgo.Conn) {
 	}
 }
 
-// handleStream 复用共享 UDPConn 收发
-// 注意：互斥锁保证同一时刻只有一个 stream 在收发，保证请求和响应的对应关系
-// 若目标服务是有状态的多路复用 UDP（如 QUIC），需要改为每个 stream 独立 UDPConn
+// handleStream 修复：每个 stream 独立建立 UDPConn，完全并发无锁争用
+// 原来共享 UDPConn + 互斥锁的方案会让所有 UDP 请求串行化，高并发时性能极差
 func (ob *Outbound) handleStream(stream *quicgo.Stream) {
 	defer stream.Close()
 
@@ -349,18 +323,21 @@ func (ob *Outbound) handleStream(stream *quicgo.Stream) {
 		return
 	}
 
-	ob.udpMu.Lock()
-	_, err = ob.udpConn.Write(data)
+	// 每个 stream 独立 UDPConn，并发安全，无需加锁
+	udpConn, err := net.DialUDP("udp", nil, ob.targetAddr)
 	if err != nil {
-		ob.udpMu.Unlock()
-		log.Printf("[quic-outbound] UDP发送失败: %v", err)
+		log.Printf("[quic-outbound] 连接目标UDP失败: %v", err)
 		return
 	}
-	ob.udpConn.SetReadDeadline(time.Now().Add(udpReadTimeout))
-	buf := make([]byte, udpBufSize)
-	n, err := ob.udpConn.Read(buf)
-	ob.udpMu.Unlock()
+	defer udpConn.Close()
 
+	if _, err := udpConn.Write(data); err != nil {
+		return
+	}
+
+	udpConn.SetReadDeadline(time.Now().Add(udpReadTimeout))
+	buf := make([]byte, udpBufSize)
+	n, err := udpConn.Read(buf)
 	if err != nil {
 		return
 	}

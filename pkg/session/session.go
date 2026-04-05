@@ -31,11 +31,18 @@ type Session struct {
 
 	nextStreamID uint32
 
-	writeMu sync.Mutex
+	// writeMu 保护所有写操作，包括 pktCounter
+	writeMu    sync.Mutex
+	pktCounter int
 
+	// schemeMu 保护 paddingScheme
+	// 修复：paddingScheme 由 recvLoop goroutine 写、writeData goroutine 读，存在数据竞争
+	schemeMu      sync.RWMutex
 	paddingScheme *padding.Scheme
-	pktCounter    int
-	pktMu         sync.Mutex
+
+	// onSchemeUpdate 当服务端下发新 paddingScheme 时的回调（由 Inbound 注入）
+	// 修复：确保 Inbound 的 scheme 同步更新，后续新建 Session 使用最新 scheme
+	onSchemeUpdate func(*padding.Scheme)
 
 	remoteVersion int
 
@@ -64,6 +71,13 @@ func newSession(conn net.Conn, isClient bool, scheme *padding.Scheme) *Session {
 		s.nextStreamID = 0
 	}
 	return s
+}
+
+// GetScheme 线程安全地获取当前 paddingScheme
+func (s *Session) GetScheme() *padding.Scheme {
+	s.schemeMu.RLock()
+	defer s.schemeMu.RUnlock()
+	return s.paddingScheme
 }
 
 func (s *Session) IsClosed() bool {
@@ -98,33 +112,41 @@ func (s *Session) close(err error) {
 	})
 }
 
+// writeFrame 加锁写帧（不涉及 pktCounter）
 func (s *Session) writeFrame(cmd uint8, streamID uint32, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	return frame.WriteFrame(s.conn, cmd, streamID, data)
 }
 
+// writeData 加锁写数据帧，维护 pktCounter 和 padding
 func (s *Session) writeData(streamID uint32, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	s.pktMu.Lock()
 	idx := s.pktCounter
 	s.pktCounter++
-	s.pktMu.Unlock()
 
-	if idx >= s.paddingScheme.Stop {
+	// 修复：通过 schemeMu 读锁安全读取 paddingScheme
+	s.schemeMu.RLock()
+	scheme := s.paddingScheme
+	s.schemeMu.RUnlock()
+
+	if idx >= scheme.Stop {
 		return frame.WriteFrame(s.conn, frame.CmdPSH, streamID, data)
 	}
 
-	segs, ok := s.paddingScheme.Rules[idx]
+	segs, ok := scheme.Rules[idx]
 	if !ok || len(segs) == 0 {
 		return frame.WriteFrame(s.conn, frame.CmdPSH, streamID, data)
 	}
 
+	// 注意：applyPadding 直接写 s.conn，不调用 writeFrame
+	// 因为此处已持有 writeMu，再调用 writeFrame 会死锁
 	return s.applyPadding(streamID, data, segs)
 }
 
+// applyPadding 必须在持有 writeMu 时调用，直接写 s.conn
 func (s *Session) applyPadding(streamID uint32, data []byte, segs []padding.Segment) error {
 	offset := 0
 
@@ -218,8 +240,15 @@ func (s *Session) handleFrame(f *frame.Frame) error {
 			log.Printf("[session] invalid padding scheme: %v", err)
 			return nil
 		}
+		// 修复：加写锁保护 paddingScheme 写操作
+		s.schemeMu.Lock()
 		s.paddingScheme = scheme
+		s.schemeMu.Unlock()
 		log.Printf("[session] padding scheme updated md5=%s", scheme.MD5())
+		// 修复：通知 Inbound 同步更新，后续新 Session 使用最新 scheme
+		if s.onSchemeUpdate != nil {
+			s.onSchemeUpdate(scheme)
+		}
 
 	case frame.CmdSYNACK:
 		s.synackWaitersMu.Lock()
@@ -313,18 +342,19 @@ type ClientSession struct {
 	idleMu sync.Mutex
 }
 
-func NewClientSession(conn net.Conn, password string, scheme *padding.Scheme) (*ClientSession, error) {
+// NewClientSession 修复：增加 onSchemeUpdate 参数，使 Inbound 能感知 scheme 更新
+func NewClientSession(conn net.Conn, password string, scheme *padding.Scheme, onSchemeUpdate func(*padding.Scheme)) (*ClientSession, error) {
 	cs := &ClientSession{
 		Session: newSession(conn, true, scheme),
 	}
+	cs.Session.onSchemeUpdate = onSchemeUpdate
 
 	settingsData := buildClientSettings(scheme)
 	if err := cs.writeFrame(frame.CmdSettings, 0, settingsData); err != nil {
 		return nil, err
 	}
 
-	// cmdSettings 占用了包1的计数（与首个cmdSYN+cmdPSH合并为包1）
-	// 因此后续 writeData 从包2开始计，与协议定义一致
+	// cmdSettings 占用包1计数，后续 writeData 从包2开始
 	cs.pktCounter = 1
 
 	go cs.recvLoop()
@@ -357,7 +387,6 @@ func (cs *ClientSession) OpenStream() (*Stream, error) {
 		return nil, err
 	}
 
-	// v2: 等待SYNACK
 	if cs.remoteVersion >= 2 {
 		ch := make(chan error, 1)
 		cs.synackWaitersMu.Lock()

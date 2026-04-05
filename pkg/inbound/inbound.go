@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"anygo/config"
@@ -21,9 +22,13 @@ const dialTimeout = 10 * time.Second
 
 // Inbound 境内入口节点，扮演AnyTLS客户端角色
 type Inbound struct {
-	cfg    *config.MergedConfig
-	scheme *padding.Scheme
-	pool   *session.Pool
+	cfg  *config.MergedConfig
+	pool *session.Pool
+
+	// 修复：scheme 用读写锁保护，收到服务端 cmdUpdatePaddingScheme 后同步更新
+	// 确保后续新建 Session 时使用最新 scheme，不再每次触发服务端重发更新
+	scheme   *padding.Scheme
+	schemeMu sync.RWMutex
 }
 
 func New(cfg *config.MergedConfig) *Inbound {
@@ -66,16 +71,36 @@ func (ib *Inbound) Run() error {
 	}
 }
 
+// getScheme 线程安全地获取当前 scheme
+func (ib *Inbound) getScheme() *padding.Scheme {
+	ib.schemeMu.RLock()
+	defer ib.schemeMu.RUnlock()
+	return ib.scheme
+}
+
+// updateScheme 由 Session 的 onSchemeUpdate 回调触发
+func (ib *Inbound) updateScheme(scheme *padding.Scheme) {
+	ib.schemeMu.Lock()
+	ib.scheme = scheme
+	ib.schemeMu.Unlock()
+	log.Printf("[inbound:%s] padding scheme 已同步更新 md5=%s", ib.cfg.Listen, scheme.MD5())
+}
+
 func (ib *Inbound) dialSession() (*session.ClientSession, error) {
 	conn, err := ib.dialTLS()
 	if err != nil {
 		return nil, err
 	}
-	if err := ib.sendAuth(conn); err != nil {
+
+	scheme := ib.getScheme()
+
+	if err := ib.sendAuth(conn, scheme); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("auth failed: %w", err)
 	}
-	cs, err := session.NewClientSession(conn, ib.cfg.Password, ib.scheme)
+
+	// 传入 onSchemeUpdate 回调，Session 收到更新时通知 Inbound 同步
+	cs, err := session.NewClientSession(conn, ib.cfg.Password, scheme, ib.updateScheme)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("session handshake failed: %w", err)
@@ -85,7 +110,7 @@ func (ib *Inbound) dialSession() (*session.ClientSession, error) {
 
 // dialTLS 建立TLS连接：
 //   - 有 SNI：使用 uTLS 伪装 Chrome 指纹；insecure 控制是否验证证书
-//   - 无 SNI + insecure=true：自签证书且无需指纹伪装，使用标准 Go TLS
+//   - 无 SNI：自签证书，使用标准 Go TLS 跳过验证
 func (ib *Inbound) dialTLS() (net.Conn, error) {
 	tcpConn, err := net.DialTimeout("tcp", ib.cfg.Remote, dialTimeout)
 	if err != nil {
@@ -105,7 +130,6 @@ func (ib *Inbound) dialTLS() (net.Conn, error) {
 		return uConn, nil
 	}
 
-	// 无 SNI：标准 Go TLS，跳过证书验证
 	tlsConfig := &tls.Config{InsecureSkipVerify: true}
 	tlsConn := tls.Client(tcpConn, tlsConfig)
 	if err := tlsConn.Handshake(); err != nil {
@@ -115,9 +139,9 @@ func (ib *Inbound) dialTLS() (net.Conn, error) {
 	return tlsConn, nil
 }
 
-func (ib *Inbound) sendAuth(conn net.Conn) error {
+func (ib *Inbound) sendAuth(conn net.Conn, scheme *padding.Scheme) error {
 	h := sha256.Sum256([]byte(ib.cfg.Password))
-	padding0 := padding.RandBytes(ib.scheme.Padding0Size())
+	padding0 := padding.RandBytes(scheme.Padding0Size())
 	return frame.WriteAuth(conn, h[:], padding0)
 }
 

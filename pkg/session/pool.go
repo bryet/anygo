@@ -43,8 +43,7 @@ func NewPool(
 	return p
 }
 
-// GetStream 获取一个可用的Stream：优先从空闲Session中复用，否则新建Session
-// 修复：改为循环重试，避免原来递归调用可能导致的栈溢出
+// GetStream 获取一个可用的Stream，循环重试避免栈溢出
 func (p *Pool) GetStream() (*Stream, *ClientSession, error) {
 	for attempt := 0; attempt < maxGetStreamRetries; attempt++ {
 		stream, cs, err := p.tryGetStream()
@@ -60,13 +59,19 @@ func (p *Pool) GetStream() (*Stream, *ClientSession, error) {
 func (p *Pool) tryGetStream() (*Stream, *ClientSession, error) {
 	p.mu.Lock()
 
-	// 找Seq最大的空闲Session
+	// 修复：遍历时顺便清除已关闭的 Session，避免列表无限增长
+	var active []*ClientSession
+	for _, cs := range p.sessions {
+		if !cs.IsClosed() {
+			active = append(active, cs)
+		}
+	}
+	p.sessions = active
+
+	// 找 Seq 最大的空闲 Session
 	var best *ClientSession
 	bestIdx := -1
 	for i, cs := range p.sessions {
-		if cs.IsClosed() {
-			continue
-		}
 		if cs.IsIdle() {
 			if best == nil || cs.seq > best.seq {
 				best = cs
@@ -82,7 +87,6 @@ func (p *Pool) tryGetStream() (*Stream, *ClientSession, error) {
 
 		stream, err := best.OpenStream()
 		if err != nil {
-			// Session已失效，关闭它，下次会新建
 			best.close(err)
 			return nil, nil, err
 		}
@@ -90,7 +94,7 @@ func (p *Pool) tryGetStream() (*Stream, *ClientSession, error) {
 	}
 	p.mu.Unlock()
 
-	// 没有空闲Session，新建
+	// 没有空闲 Session，新建
 	cs, err := p.newSession()
 	if err != nil {
 		return nil, nil, err
@@ -159,7 +163,7 @@ func (p *Pool) cleanup() {
 		}
 	}
 
-	// 按Seq从大到小排序（Seq大=最新）
+	// 按 Seq 从大到小排序（Seq大=最新）
 	sort.Slice(alive, func(i, j int) bool {
 		return alive[i].seq > alive[j].seq
 	})

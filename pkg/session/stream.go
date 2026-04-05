@@ -15,6 +15,11 @@ const (
 )
 
 // Stream 复用Session上的一条虚拟连接，实现net.Conn接口
+//
+// 锁顺序规范（避免死锁）：
+//
+//	stateMu 和 readMu 永远不同时持有。
+//	Read 检查 state 时：临时释放 readMu → 加 stateMu → 释放 stateMu → 重新加 readMu
 type Stream struct {
 	id      uint32
 	session *Session
@@ -57,12 +62,12 @@ func (s *Stream) pushData(data []byte) {
 }
 
 // Read 实现net.Conn
-// timer 在循环外只创建一次并复用，避免每次 Wait 被唤醒后重新分配
+// 修复：检查 state 时临时释放 readMu，避免与 Close/closeByRemote 的锁顺序冲突
+// timer 在循环外创建一次并复用，避免重复分配
 func (s *Stream) Read(buf []byte) (int, error) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
-	// 在循环外创建 timer，避免重复分配
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
@@ -78,11 +83,20 @@ func (s *Stream) Read(buf []byte) (int, error) {
 			return n, nil
 		}
 
-		// 检查是否关闭
+		// 修复：检查 state 时先释放 readMu，单独加 stateMu，不嵌套持有两个锁
+		s.readMu.Unlock()
 		s.stateMu.Lock()
 		closed := s.state == streamClosed
 		s.stateMu.Unlock()
+		s.readMu.Lock()
+
 		if closed {
+			// 关闭后再检查一次缓冲，确保已推送的数据不丢失
+			if len(s.readBuf) > 0 {
+				n := copy(buf, s.readBuf)
+				s.readBuf = s.readBuf[n:]
+				return n, nil
+			}
 			return 0, io.EOF
 		}
 
@@ -105,12 +119,10 @@ func (s *Stream) Read(buf []byte) (int, error) {
 				timer.Reset(remaining)
 			}
 			s.readCond.Wait()
-			// 被唤醒后再次检查 deadline
 			if !deadline.IsZero() && time.Now().After(deadline) {
 				return 0, &timeoutError{}
 			}
 		} else {
-			// 无 deadline，停掉旧 timer 避免误触发
 			if timer != nil {
 				timer.Stop()
 				timer = nil
@@ -136,16 +148,14 @@ func (s *Stream) Write(data []byte) (int, error) {
 }
 
 // Close 关闭Stream，发送cmdFIN
+// 修复：Signal 不需要持有 readMu（Cond.Signal 是并发安全的）
 func (s *Stream) Close() error {
 	s.once.Do(func() {
 		s.stateMu.Lock()
 		s.state = streamClosed
 		s.stateMu.Unlock()
 
-		s.readMu.Lock()
 		s.readCond.Signal()
-		s.readMu.Unlock()
-
 		s.session.closeStream(s.id)
 		close(s.closeCh)
 	})
@@ -158,9 +168,7 @@ func (s *Stream) closeByRemote() {
 	s.state = streamClosed
 	s.stateMu.Unlock()
 
-	s.readMu.Lock()
 	s.readCond.Signal()
-	s.readMu.Unlock()
 
 	s.once.Do(func() {
 		close(s.closeCh)
