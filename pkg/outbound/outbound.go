@@ -120,20 +120,24 @@ func (ob *Outbound) handleStream(stream *session.Stream) {
 }
 
 // fallbackHTTP 认证失败时返回仿 nginx 的 HTTP 响应，防止主动探测识别
+// 修复：动态计算 Content-Length，避免写死导致长度与实际 body 不符
 func (ob *Outbound) fallbackHTTP(conn net.Conn) {
+	body := "<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>\n" +
+		"<style>body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;}</style>\n" +
+		"</head>\n<body>\n<h1>Welcome to nginx!</h1>\n" +
+		"<p>If you see this page, the nginx web server is successfully installed and working.</p>\n" +
+		"<p><em>Thank you for using nginx.</em></p>\n</body>\n</html>\n"
+
 	now := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
 	resp := "HTTP/1.1 200 OK\r\n" +
 		"Server: nginx/1.24.0\r\n" +
 		"Date: " + now + "\r\n" +
 		"Content-Type: text/html; charset=utf-8\r\n" +
-		"Content-Length: 615\r\n" +
+		fmt.Sprintf("Content-Length: %d\r\n", len(body)) +
 		"Connection: keep-alive\r\n" +
 		"\r\n" +
-		"<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>\n" +
-		"<style>body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;}</style>\n" +
-		"</head>\n<body>\n<h1>Welcome to nginx!</h1>\n" +
-		"<p>If you see this page, the nginx web server is successfully installed and working.</p>\n" +
-		"<p><em>Thank you for using nginx.</em></p>\n</body>\n</html>\n"
+		body
+
 	conn.Write([]byte(resp))
 }
 

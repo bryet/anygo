@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // DefaultSchemeText 默认PaddingScheme文本（官方默认值）
@@ -90,10 +91,23 @@ func Parse(text string) (*Scheme, error) {
 	return scheme, nil
 }
 
-// Default 返回解析好的默认PaddingScheme
+// 修复：用 sync.Once 缓存默认 scheme，避免每次调用 Default() 重新解析
+var (
+	defaultSchemeOnce sync.Once
+	defaultScheme     *Scheme
+)
+
+// Default 返回解析好的默认PaddingScheme（全局单例，只解析一次）
 func Default() *Scheme {
-	s, _ := Parse(DefaultSchemeText)
-	return s
+	defaultSchemeOnce.Do(func() {
+		var err error
+		defaultScheme, err = Parse(DefaultSchemeText)
+		if err != nil {
+			// DefaultSchemeText 是硬编码的合法值，不应出错
+			panic(fmt.Sprintf("parse default padding scheme failed: %v", err))
+		}
+	})
+	return defaultScheme
 }
 
 func parseSegments(s string) ([]Segment, error) {

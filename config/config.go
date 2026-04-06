@@ -10,9 +10,10 @@ import (
 )
 
 // TunnelConfig 单条转发规则
+// Mode 由字段自动识别：有 cert+key 为 outbound，否则为 inbound
 type TunnelConfig struct {
 	Listen   string `yaml:"listen"`
-	Remote   string `yaml:"remote"` // TCP和UDP隧道共用同一目标
+	Remote   string `yaml:"remote"`
 	SNI      string `yaml:"sni"`
 	Insecure bool   `yaml:"insecure"`
 	Password string `yaml:"password"`
@@ -69,7 +70,7 @@ type Config struct {
 	// 全局参数（outbound用）
 	PaddingScheme string `yaml:"padding_scheme"`
 
-	// 多条转发规则
+	// 多条转发规则，每条独立判断 inbound/outbound，可混用
 	Tunnels []TunnelConfig `yaml:"tunnels"`
 }
 
@@ -89,23 +90,12 @@ func (c *Config) Validate() error {
 	if len(c.Tunnels) == 0 {
 		return errors.New("至少需要配置一条 tunnels 规则")
 	}
-	mode := c.Tunnels[0].Mode()
 	for i, t := range c.Tunnels {
 		if err := t.Validate(i); err != nil {
 			return err
 		}
-		if t.Mode() != mode {
-			return fmt.Errorf("tunnels[%d]: 不能混用 inbound 和 outbound 规则", i)
-		}
 	}
 	return nil
-}
-
-func (c *Config) Mode() string {
-	if len(c.Tunnels) == 0 {
-		return "unknown"
-	}
-	return c.Tunnels[0].Mode()
 }
 
 // MergedConfig 单条规则 + 全局参数
