@@ -23,6 +23,7 @@ tunnels:         # 支持多组转发
     sni: "bing.com"     # TLS伪装域名
     insecure: true     # Let's Encrypt请注释本行
     password: "lMgab3FiW5"     # 与出口保持一致
+    max_conns: 100    # 最大并发连接数，0或不填表示不限制
 
   - listen: "[::]:44716"         # 监听地址，接受境内入口连接,支持TCP and UDP 连接
     remote: "127.0.0.1:25256"  # 目标服务器
@@ -30,3 +31,4 @@ tunnels:         # 支持多组转发
     password: "lMgab3FiW5"     # 与入口保持一致
     cert: "/var/anygo/server.crt"     # 证书路径（自签or Let's Encrypt）
     key:  "/var/anygo/server.key"     # 私钥路径（自签or Let's Encrypt）
+    max_conns: 100    # 最大并发连接数，0或不填表示不限制
