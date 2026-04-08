@@ -5,20 +5,33 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"anygo/config"
 	"anygo/pkg/frame"
+	"anygo/pkg/logger"
 	"anygo/pkg/padding"
 	"anygo/pkg/session"
 )
+
+// stats 流量统计
+type stats struct {
+	totalConns  atomic.Int64
+	activeConns atomic.Int64
+	bytesIn     atomic.Int64
+	bytesOut    atomic.Int64
+}
 
 // Outbound 境外出口节点，扮演AnyTLS服务端角色
 type Outbound struct {
 	cfg    *config.MergedConfig
 	scheme *padding.Scheme
+	stats  stats
+
+	// semaphore 限制最大并发连接数
+	sem chan struct{}
 }
 
 func New(cfg *config.MergedConfig) *Outbound {
@@ -26,12 +39,16 @@ func New(cfg *config.MergedConfig) *Outbound {
 	if cfg.PaddingScheme != "" {
 		s, err := padding.Parse(cfg.PaddingScheme)
 		if err != nil {
-			log.Printf("[outbound] 无效的paddingScheme，使用默认值: %v", err)
+			logger.Warn("[outbound] 无效的paddingScheme，使用默认值: %v", err)
 		} else {
 			scheme = s
 		}
 	}
-	return &Outbound{cfg: cfg, scheme: scheme}
+	ob := &Outbound{cfg: cfg, scheme: scheme}
+	if cfg.MaxConns > 0 {
+		ob.sem = make(chan struct{}, cfg.MaxConns)
+	}
+	return ob
 }
 
 func (ob *Outbound) Run() error {
@@ -45,15 +62,50 @@ func (ob *Outbound) Run() error {
 		return err
 	}
 
-	log.Printf("[outbound] 监听 %s → %s  padding_md5=%s", ob.cfg.Listen, ob.cfg.Remote, ob.scheme.MD5())
+	maxConnsStr := "unlimited"
+	if ob.cfg.MaxConns > 0 {
+		maxConnsStr = fmt.Sprintf("%d", ob.cfg.MaxConns)
+	}
+	logger.Info("[outbound] 监听 %s → %s  padding_md5=%s  max_conns=%s",
+		ob.cfg.Listen, ob.cfg.Remote, ob.scheme.MD5(), maxConnsStr)
+
+	// 定期打印流量统计
+	go ob.statsLoop()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("[outbound:%s] accept error: %v", ob.cfg.Listen, err)
+			logger.Error("[outbound:%s] accept error: %v", ob.cfg.Listen, err)
 			continue
 		}
+
+		// 连接数限制
+		if ob.sem != nil {
+			select {
+			case ob.sem <- struct{}{}:
+			default:
+				logger.Warn("[outbound:%s] 连接数已达上限 %d，拒绝连接 from %s",
+					ob.cfg.Listen, ob.cfg.MaxConns, conn.RemoteAddr())
+				conn.Close()
+				continue
+			}
+		}
+
 		go ob.handleConn(conn)
+	}
+}
+
+func (ob *Outbound) statsLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		logger.Info("[outbound:%s] 统计 | 累计连接: %d  活跃: %d  收: %s  发: %s",
+			ob.cfg.Listen,
+			ob.stats.totalConns.Load(),
+			ob.stats.activeConns.Load(),
+			formatBytes(ob.stats.bytesIn.Load()),
+			formatBytes(ob.stats.bytesOut.Load()),
+		)
 	}
 }
 
@@ -69,18 +121,28 @@ func (ob *Outbound) buildTLSConfig() (*tls.Config, error) {
 }
 
 func (ob *Outbound) handleConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		ob.stats.activeConns.Add(-1)
+		if ob.sem != nil {
+			<-ob.sem
+		}
+	}()
+
+	ob.stats.totalConns.Add(1)
+	ob.stats.activeConns.Add(1)
 
 	if err := ob.authenticate(conn); err != nil {
-		log.Printf("[outbound:%s] 认证失败 from %s: %v，fallback HTTP", ob.cfg.Listen, conn.RemoteAddr(), err)
+		logger.Warn("[outbound:%s] 认证失败 from %s: %v，fallback HTTP",
+			ob.cfg.Listen, conn.RemoteAddr(), err)
 		ob.fallbackHTTP(conn)
 		return
 	}
-	log.Printf("[outbound:%s] 认证成功: %s", ob.cfg.Listen, conn.RemoteAddr())
+	logger.Debug("[outbound:%s] 认证成功: %s", ob.cfg.Listen, conn.RemoteAddr())
 
 	ss, err := session.NewServerSession(conn, ob.scheme)
 	if err != nil {
-		log.Printf("[outbound:%s] session握手失败: %v", ob.cfg.Listen, err)
+		logger.Error("[outbound:%s] session握手失败: %v", ob.cfg.Listen, err)
 		return
 	}
 
@@ -110,17 +172,22 @@ func (ob *Outbound) handleStream(stream *session.Stream) {
 
 	targetConn, err := net.Dial("tcp", ob.cfg.Remote)
 	if err != nil {
-		log.Printf("[outbound:%s] 连接目标 %s 失败: %v", ob.cfg.Listen, ob.cfg.Remote, err)
+		logger.Error("[outbound:%s] 连接目标 %s 失败: %v", ob.cfg.Listen, ob.cfg.Remote, err)
 		return
 	}
 	defer targetConn.Close()
 
-	log.Printf("[outbound:%s] stream #%d → %s", ob.cfg.Listen, stream.ID(), ob.cfg.Remote)
-	relay(stream, targetConn)
+	logger.Debug("[outbound:%s] stream #%d → %s", ob.cfg.Listen, stream.ID(), ob.cfg.Remote)
+
+	in, out := relayWithStats(stream, targetConn)
+	ob.stats.bytesIn.Add(in)
+	ob.stats.bytesOut.Add(out)
+
+	logger.Debug("[outbound:%s] stream #%d 结束 收%s 发%s",
+		ob.cfg.Listen, stream.ID(), formatBytes(in), formatBytes(out))
 }
 
 // fallbackHTTP 认证失败时返回仿 nginx 的 HTTP 响应，防止主动探测识别
-// 修复：动态计算 Content-Length，避免写死导致长度与实际 body 不符
 func (ob *Outbound) fallbackHTTP(conn net.Conn) {
 	body := "<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>\n" +
 		"<style>body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;}</style>\n" +
@@ -141,19 +208,37 @@ func (ob *Outbound) fallbackHTTP(conn net.Conn) {
 	conn.Write([]byte(resp))
 }
 
-// relay 双向转发，等待两个方向都结束后再返回
-func relay(a, b io.ReadWriter) {
+func relayWithStats(a, b io.ReadWriter) (int64, int64) {
+	var bytesAtoB, bytesBtoA int64
 	done := make(chan struct{}, 2)
+
 	go func() {
-		io.Copy(a, b)
+		n, _ := io.Copy(b, a)
+		bytesAtoB = n
 		done <- struct{}{}
 	}()
 	go func() {
-		io.Copy(b, a)
+		n, _ := io.Copy(a, b)
+		bytesBtoA = n
 		done <- struct{}{}
 	}()
+
 	<-done
 	<-done
+	return bytesAtoB, bytesBtoA
+}
+
+func formatBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2fGB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.2fMB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.2fKB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
 }
 
 func equalBytes(a, b []byte) bool {

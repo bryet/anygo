@@ -5,13 +5,15 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"anygo/config"
+	"anygo/pkg/logger"
 
 	quicgo "github.com/quic-go/quic-go"
 )
@@ -23,10 +25,6 @@ const (
 	udpBufSize     = 65535
 	quicALPN       = "anygo-udp"
 )
-
-// ─────────────────────────────────────────────────
-// 公用帧读写：[2字节长度 BE][数据]
-// ─────────────────────────────────────────────────
 
 func writeFrame(w io.Writer, data []byte) error {
 	buf := make([]byte, 2+len(data))
@@ -63,15 +61,34 @@ func equalBytes(a, b []byte) bool {
 	return diff == 0
 }
 
+func formatBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2fGB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.2fMB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.2fKB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
+}
+
 // ─────────────────────────────────────────────────
 // Inbound：境内UDP入口，QUIC客户端
 // ─────────────────────────────────────────────────
 
-// dialCall 用于实现 singleflight：同一时刻只允许一个 goroutine 重建连接
 type dialCall struct {
 	wg  sync.WaitGroup
 	val *quicgo.Conn
 	err error
+}
+
+type inboundStats struct {
+	totalPkts  atomic.Int64
+	activePkts atomic.Int64
+	bytesIn    atomic.Int64
+	bytesOut   atomic.Int64
 }
 
 type Inbound struct {
@@ -81,10 +98,17 @@ type Inbound struct {
 
 	dialMu  sync.Mutex
 	dialing *dialCall
+
+	stats inboundStats
+	sem   chan struct{}
 }
 
 func NewInbound(cfg *config.MergedConfig) *Inbound {
-	return &Inbound{cfg: cfg}
+	ib := &Inbound{cfg: cfg}
+	if cfg.MaxConns > 0 {
+		ib.sem = make(chan struct{}, cfg.MaxConns)
+	}
+	return ib
 }
 
 func (ib *Inbound) Run() error {
@@ -98,22 +122,52 @@ func (ib *Inbound) Run() error {
 	}
 	defer conn.Close()
 
-	log.Printf("[quic-inbound] 监听 %s → %s", ib.cfg.Listen, ib.cfg.Remote)
+	maxConnsStr := "unlimited"
+	if ib.cfg.MaxConns > 0 {
+		maxConnsStr = fmt.Sprintf("%d", ib.cfg.MaxConns)
+	}
+	logger.Info("[quic-inbound] 监听 %s → %s  max_conns=%s", ib.cfg.Listen, ib.cfg.Remote, maxConnsStr)
+
+	go ib.statsLoop()
 
 	buf := make([]byte, udpBufSize)
 	for {
 		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("[quic-inbound:%s] read error: %v", ib.cfg.Listen, err)
+			logger.Error("[quic-inbound:%s] read error: %v", ib.cfg.Listen, err)
 			continue
 		}
+
+		// UDP 包数量限制
+		if ib.sem != nil {
+			select {
+			case ib.sem <- struct{}{}:
+			default:
+				logger.Warn("[quic-inbound:%s] 并发包数已达上限 %d，丢弃包", ib.cfg.Listen, ib.cfg.MaxConns)
+				continue
+			}
+		}
+
 		data := make([]byte, n)
 		copy(data, buf[:n])
 		go ib.handlePacket(conn, clientAddr, data)
 	}
 }
 
-// getQUICConn 快路径用读锁，慢路径用 singleflight 避免重复建连
+func (ib *Inbound) statsLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		logger.Info("[quic-inbound:%s] 统计 | 累计包: %d  并发: %d  收: %s  发: %s",
+			ib.cfg.Listen,
+			ib.stats.totalPkts.Load(),
+			ib.stats.activePkts.Load(),
+			formatBytes(ib.stats.bytesIn.Load()),
+			formatBytes(ib.stats.bytesOut.Load()),
+		)
+	}
+}
+
 func (ib *Inbound) getQUICConn() (*quicgo.Conn, error) {
 	ib.connMu.RLock()
 	conn := ib.conn
@@ -185,14 +239,25 @@ func (ib *Inbound) dialQUIC() (*quicgo.Conn, error) {
 	ib.conn = qconn
 	ib.connMu.Unlock()
 
-	log.Printf("[quic-inbound] QUIC连接建立 → %s", ib.cfg.Remote)
+	logger.Info("[quic-inbound] QUIC连接建立 → %s", ib.cfg.Remote)
 	return qconn, nil
 }
 
 func (ib *Inbound) handlePacket(localConn *net.UDPConn, clientAddr *net.UDPAddr, data []byte) {
+	defer func() {
+		ib.stats.activePkts.Add(-1)
+		if ib.sem != nil {
+			<-ib.sem
+		}
+	}()
+
+	ib.stats.totalPkts.Add(1)
+	ib.stats.activePkts.Add(1)
+	ib.stats.bytesIn.Add(int64(len(data)))
+
 	qconn, err := ib.getQUICConn()
 	if err != nil {
-		log.Printf("[quic-inbound] 获取QUIC连接失败: %v", err)
+		logger.Error("[quic-inbound] 获取QUIC连接失败: %v", err)
 		return
 	}
 
@@ -201,7 +266,7 @@ func (ib *Inbound) handlePacket(localConn *net.UDPConn, clientAddr *net.UDPAddr,
 
 	stream, err := qconn.OpenStreamSync(ctx)
 	if err != nil {
-		log.Printf("[quic-inbound] 打开stream失败: %v", err)
+		logger.Error("[quic-inbound] 打开stream失败: %v", err)
 		ib.connMu.Lock()
 		ib.conn = nil
 		ib.connMu.Unlock()
@@ -210,7 +275,7 @@ func (ib *Inbound) handlePacket(localConn *net.UDPConn, clientAddr *net.UDPAddr,
 	defer stream.Close()
 
 	if err := writeFrame(stream, data); err != nil {
-		log.Printf("[quic-inbound] 发送请求失败: %v", err)
+		logger.Debug("[quic-inbound] 发送请求失败: %v", err)
 		return
 	}
 
@@ -218,7 +283,7 @@ func (ib *Inbound) handlePacket(localConn *net.UDPConn, clientAddr *net.UDPAddr,
 	resp, err := readFrame(stream)
 	if err != nil {
 		if err != io.EOF {
-			log.Printf("[quic-inbound] 读取响应失败: %v", err)
+			logger.Debug("[quic-inbound] 读取响应失败: %v", err)
 		}
 		return
 	}
@@ -226,6 +291,7 @@ func (ib *Inbound) handlePacket(localConn *net.UDPConn, clientAddr *net.UDPAddr,
 		return
 	}
 
+	ib.stats.bytesOut.Add(int64(len(resp)))
 	localConn.WriteToUDP(resp, clientAddr)
 }
 
@@ -233,26 +299,39 @@ func (ib *Inbound) handlePacket(localConn *net.UDPConn, clientAddr *net.UDPAddr,
 // Outbound：境外UDP出口，QUIC服务端
 // ─────────────────────────────────────────────────
 
+type outboundStats struct {
+	totalConns  atomic.Int64
+	activeConns atomic.Int64
+	bytesIn     atomic.Int64
+	bytesOut    atomic.Int64
+}
+
 type Outbound struct {
 	cfg        *config.MergedConfig
 	targetAddr *net.UDPAddr // 预解析，避免每个 stream 重复 DNS 解析
+	stats      outboundStats
+	sem        chan struct{}
 }
 
 func NewOutbound(cfg *config.MergedConfig) *Outbound {
-	return &Outbound{cfg: cfg}
+	ob := &Outbound{cfg: cfg}
+	if cfg.MaxConns > 0 {
+		ob.sem = make(chan struct{}, cfg.MaxConns)
+	}
+	return ob
 }
 
 func (ob *Outbound) Run() error {
-	// 启动时预解析目标地址
+	// 预解析目标地址
 	targetAddr, err := net.ResolveUDPAddr("udp", ob.cfg.Remote)
 	if err != nil {
-		return err
+		return fmt.Errorf("解析目标UDP地址失败: %w", err)
 	}
 	ob.targetAddr = targetAddr
 
 	cert, err := tls.LoadX509KeyPair(ob.cfg.Cert, ob.cfg.Key)
 	if err != nil {
-		return err
+		return fmt.Errorf("加载证书失败: %w", err)
 	}
 
 	tlsCfg := &tls.Config{
@@ -269,20 +348,60 @@ func (ob *Outbound) Run() error {
 	}
 	defer listener.Close()
 
-	log.Printf("[quic-outbound] QUIC监听 %s → %s", ob.cfg.Listen, ob.cfg.Remote)
+	maxConnsStr := "unlimited"
+	if ob.cfg.MaxConns > 0 {
+		maxConnsStr = fmt.Sprintf("%d", ob.cfg.MaxConns)
+	}
+	logger.Info("[quic-outbound] QUIC监听 %s → %s  max_conns=%s", ob.cfg.Listen, ob.cfg.Remote, maxConnsStr)
+
+	go ob.statsLoop()
 
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
-			log.Printf("[quic-outbound] accept error: %v", err)
+			logger.Error("[quic-outbound] accept error: %v", err)
 			continue
 		}
+
+		if ob.sem != nil {
+			select {
+			case ob.sem <- struct{}{}:
+			default:
+				logger.Warn("[quic-outbound:%s] 连接数已达上限 %d，拒绝", ob.cfg.Listen, ob.cfg.MaxConns)
+				conn.CloseWithError(0, "too many connections")
+				continue
+			}
+		}
+
 		go ob.handleConn(conn)
 	}
 }
 
+func (ob *Outbound) statsLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		logger.Info("[quic-outbound:%s] 统计 | 累计连接: %d  活跃: %d  收: %s  发: %s",
+			ob.cfg.Listen,
+			ob.stats.totalConns.Load(),
+			ob.stats.activeConns.Load(),
+			formatBytes(ob.stats.bytesIn.Load()),
+			formatBytes(ob.stats.bytesOut.Load()),
+		)
+	}
+}
+
 func (ob *Outbound) handleConn(conn *quicgo.Conn) {
-	defer conn.CloseWithError(0, "done")
+	defer func() {
+		conn.CloseWithError(0, "done")
+		ob.stats.activeConns.Add(-1)
+		if ob.sem != nil {
+			<-ob.sem
+		}
+	}()
+
+	ob.stats.totalConns.Add(1)
+	ob.stats.activeConns.Add(1)
 
 	authStream, err := conn.AcceptStream(context.Background())
 	if err != nil {
@@ -297,11 +416,11 @@ func (ob *Outbound) handleConn(conn *quicgo.Conn) {
 
 	expected := sha256.Sum256([]byte(ob.cfg.Password))
 	if !equalBytes(token, expected[:]) {
-		log.Printf("[quic-outbound] 认证失败 from %s", conn.RemoteAddr())
+		logger.Warn("[quic-outbound] 认证失败 from %s", conn.RemoteAddr())
 		conn.CloseWithError(1, "auth failed")
 		return
 	}
-	log.Printf("[quic-outbound] QUIC认证成功: %s", conn.RemoteAddr())
+	logger.Debug("[quic-outbound] QUIC认证成功: %s", conn.RemoteAddr())
 
 	for {
 		stream, err := conn.AcceptStream(context.Background())
@@ -312,8 +431,7 @@ func (ob *Outbound) handleConn(conn *quicgo.Conn) {
 	}
 }
 
-// handleStream 修复：每个 stream 独立建立 UDPConn，完全并发无锁争用
-// 原来共享 UDPConn + 互斥锁的方案会让所有 UDP 请求串行化，高并发时性能极差
+// handleStream 修复：每个 stream 独立 UDPConn，完全并发，无锁争用
 func (ob *Outbound) handleStream(stream *quicgo.Stream) {
 	defer stream.Close()
 
@@ -323,10 +441,12 @@ func (ob *Outbound) handleStream(stream *quicgo.Stream) {
 		return
 	}
 
-	// 每个 stream 独立 UDPConn，并发安全，无需加锁
+	ob.stats.bytesIn.Add(int64(len(data)))
+
+	// 每个 stream 独立建立 UDPConn，避免共享连接串行化
 	udpConn, err := net.DialUDP("udp", nil, ob.targetAddr)
 	if err != nil {
-		log.Printf("[quic-outbound] 连接目标UDP失败: %v", err)
+		logger.Error("[quic-outbound] 连接目标UDP失败: %v", err)
 		return
 	}
 	defer udpConn.Close()
@@ -342,8 +462,10 @@ func (ob *Outbound) handleStream(stream *quicgo.Stream) {
 		return
 	}
 
+	ob.stats.bytesOut.Add(int64(n))
+
 	if err := writeFrame(stream, buf[:n]); err != nil {
 		return
 	}
-	log.Printf("[quic-outbound] stream#%d %d→%d bytes", stream.StreamID(), len(data), n)
+	logger.Debug("[quic-outbound] stream#%d %s→%s", stream.StreamID(), formatBytes(int64(len(data))), formatBytes(int64(n)))
 }

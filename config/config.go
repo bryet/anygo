@@ -10,7 +10,6 @@ import (
 )
 
 // TunnelConfig 单条转发规则
-// Mode 由字段自动识别：有 cert+key 为 outbound，否则为 inbound
 type TunnelConfig struct {
 	Listen   string `yaml:"listen"`
 	Remote   string `yaml:"remote"`
@@ -19,6 +18,8 @@ type TunnelConfig struct {
 	Password string `yaml:"password"`
 	Cert     string `yaml:"cert"`
 	Key      string `yaml:"key"`
+	// MaxConns 最大并发连接数，0 表示不限制
+	MaxConns int `yaml:"max_conns"`
 }
 
 func (t *TunnelConfig) Mode() string {
@@ -62,6 +63,9 @@ func (t *TunnelConfig) Validate(idx int) error {
 
 // Config 顶层配置
 type Config struct {
+	// 日志级别：debug / info / warn / error，默认 info
+	LogLevel string `yaml:"log_level"`
+
 	// 全局参数（inbound用）
 	IdleSessionCheckInterval string `yaml:"idle_session_check_interval"`
 	IdleSessionTimeout       string `yaml:"idle_session_timeout"`
@@ -75,6 +79,9 @@ type Config struct {
 }
 
 func (c *Config) applyDefaults() {
+	if c.LogLevel == "" {
+		c.LogLevel = "info"
+	}
 	if c.IdleSessionCheckInterval == "" {
 		c.IdleSessionCheckInterval = "30s"
 	}
