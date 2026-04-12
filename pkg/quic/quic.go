@@ -61,6 +61,10 @@ const (
 	heartbeatEvery = 10 * time.Second
 
 	udpBufSize = 65535
+
+	// QUIC datagram 单帧最大载荷（保守值，留出 TUIC 头部 + QUIC 帧开销）
+	// 超过此大小的 UDP 包自动拆片，接收端重组
+	maxDatagramPayload = 1100
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,6 +232,166 @@ func writePacket(w io.Writer, pkt tuicPacket) error {
 	}
 	_, err := w.Write(pkt.data)
 	return err
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 分片发送 & 重组（TUIC v5 native 模式）
+// ─────────────────────────────────────────────────────────────────────────────
+
+// fragKey 分片重组缓冲的索引 key
+type fragKey struct {
+	assocID uint16
+	pktID   uint16
+}
+
+// fragBuf 分片重组缓冲
+type fragBuf struct {
+	total    uint8
+	received uint8
+	frags    map[uint8][]byte
+	deadline time.Time
+}
+
+// sendDatagramPkt 发送一个 Packet 命令
+// 若数据超过 maxDatagramPayload，自动拆片，每片各发一个 datagram
+func sendDatagramPkt(qconn *quicgo.Conn, pkt tuicPacket) error {
+	if len(pkt.data) <= maxDatagramPayload {
+		dgram, err := writePacketBytes(pkt)
+		if err != nil {
+			return err
+		}
+		return qconn.SendDatagram(dgram)
+	}
+
+	data := pkt.data
+	total := (len(data) + maxDatagramPayload - 1) / maxDatagramPayload
+	if total > 255 {
+		total = 255
+	}
+	for i := 0; i < total; i++ {
+		start := i * maxDatagramPayload
+		end := start + maxDatagramPayload
+		if end > len(data) {
+			end = len(data)
+		}
+		addr := tuicAddr{typ: addrNone, port: 0}
+		if i == 0 {
+			addr = pkt.addr // 第一片携带原始地址
+		}
+		frag := tuicPacket{
+			assocID:   pkt.assocID,
+			pktID:     pkt.pktID,
+			fragTotal: uint8(total),
+			fragID:    uint8(i),
+			size:      uint16(end - start),
+			addr:      addr,
+			data:      data[start:end],
+		}
+		dgram, err := writePacketBytes(frag)
+		if err != nil {
+			return err
+		}
+		if err := qconn.SendDatagram(dgram); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reassemblePkt 将收到的 pkt 加入分片缓冲，若所有片到齐则返回重组后的完整数据
+// frags 由调用方管理（单 goroutine），无需加锁
+// 返回 (data, true) 表示重组完成；(nil, false) 表示等待更多片
+func reassemblePkt(frags map[fragKey]*fragBuf, pkt tuicPacket) ([]byte, bool) {
+	if pkt.fragTotal == 1 {
+		// 不分片，直接返回（copy 防止底层 slice 被重用）
+		data := make([]byte, len(pkt.data))
+		copy(data, pkt.data)
+		return data, true
+	}
+
+	key := fragKey{assocID: pkt.assocID, pktID: pkt.pktID}
+	fb, ok := frags[key]
+	if !ok {
+		fb = &fragBuf{
+			total:    pkt.fragTotal,
+			frags:    make(map[uint8][]byte),
+			deadline: time.Now().Add(10 * time.Second),
+		}
+		frags[key] = fb
+	}
+	// 保存分片（copy 防止底层复用）
+	buf := make([]byte, len(pkt.data))
+	copy(buf, pkt.data)
+	fb.frags[pkt.fragID] = buf
+	fb.received++
+
+	if fb.received < fb.total {
+		return nil, false
+	}
+
+	// 所有片到齐，按 fragID 顺序拼接
+	var full []byte
+	for i := uint8(0); i < fb.total; i++ {
+		full = append(full, fb.frags[i]...)
+	}
+	delete(frags, key)
+	return full, true
+}
+
+// writePacketBytes 将 Packet 命令序列化为 []byte，用于 QUIC datagram 发送
+func writePacketBytes(pkt tuicPacket) ([]byte, error) {
+	// 估算地址长度
+	var addrLen int
+	switch pkt.addr.typ {
+	case addrIPv4:
+		addrLen = 1 + 4 + 2
+	case addrIPv6:
+		addrLen = 1 + 16 + 2
+	case addrDomain:
+		addrLen = 1 + 1 + len(pkt.addr.host) + 2
+	case addrNone:
+		addrLen = 1 + 2
+	default:
+		addrLen = 1 + 2
+	}
+	buf := make([]byte, 0, 1+1+2+2+1+1+2+addrLen+len(pkt.data))
+	w := &bytesBuilder{buf: buf}
+	if err := writePacket(w, pkt); err != nil {
+		return nil, err
+	}
+	return w.buf, nil
+}
+
+// bytesBuilder 实现 io.Writer，追加到内部 slice
+type bytesBuilder struct{ buf []byte }
+
+func (b *bytesBuilder) Write(p []byte) (int, error) {
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+// readPacketFromBytes 从 []byte 解析 Packet 命令（跳过 VER+TYPE 两字节头）
+func readPacketFromBytes(data []byte) (tuicPacket, error) {
+	if len(data) < 2 {
+		return tuicPacket{}, fmt.Errorf("datagram too short")
+	}
+	r := &bytesReader{data: data[2:]} // 跳过 VER+TYPE
+	return readPacket(r)
+}
+
+// bytesReader 实现 io.Reader，从固定 []byte 读取
+type bytesReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *bytesReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,26 +588,7 @@ func (ib *Inbound) handleUDP(clientAddr *net.UDPAddr, data []byte) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-
-	// 开一条单向 stream 发送 Packet 命令
-	stream, err := qconn.OpenUniStreamSync(ctx)
-	if err != nil {
-		select {
-		case <-qconn.Context().Done():
-			ib.connMu.Lock()
-			ib.conn = nil
-			ib.connMu.Unlock()
-		default:
-		}
-		logger.Error("[tuic-inbound] 打开单向stream失败: %v", err)
-		return
-	}
-
 	// 构造 Packet 命令
-	// addr 字段：anygo 作为透明隧道，目标地址固定填 None（出口自行决定转发目标）
-	// 若需要真正的目标地址路由，可在此传入
 	pkt := tuicPacket{
 		assocID:   sess.assocID,
 		pktID:     sess.allocPktID(),
@@ -454,14 +599,19 @@ func (ib *Inbound) handleUDP(clientAddr *net.UDPAddr, data []byte) {
 		data:      data,
 	}
 
-	if err := writePacket(stream, pkt); err != nil {
-		stream.Close()
-		logger.Debug("[tuic-inbound] 发送Packet失败: %v", err)
+	// 通过 QUIC datagram 发送（超过 maxDatagramPayload 自动分片）
+	if err := sendDatagramPkt(qconn, pkt); err != nil {
+		select {
+		case <-qconn.Context().Done():
+			ib.connMu.Lock()
+			ib.conn = nil
+			ib.connMu.Unlock()
+		default:
+		}
+		logger.Debug("[tuic-inbound] 发送Datagram失败: %v", err)
 		return
 	}
-	stream.Close()
-
-	logger.Debug("[tuic-inbound] → Packet assocID=%d pktID=%d size=%d",
+	logger.Debug("[tuic-inbound] → Packet(dgram) assocID=%d pktID=%d size=%d",
 		pkt.assocID, pkt.pktID, pkt.size)
 }
 
@@ -511,10 +661,14 @@ func (ib *Inbound) dial() (*quicgo.Conn, error) {
 	defer cancel()
 
 	qconn, err := quicgo.DialAddr(ctx, ib.cfg.Remote, tlsCfg, &quicgo.Config{
-		MaxIdleTimeout:       idleTimeout,
-		KeepAlivePeriod:      15 * time.Second,
-		MaxIncomingUniStreams: 65535,
-		EnableDatagrams:      true,
+		MaxIdleTimeout:                 idleTimeout,
+		KeepAlivePeriod:                15 * time.Second,
+		MaxIncomingUniStreams:           65535,
+		EnableDatagrams:                true,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,
+		MaxStreamReceiveWindow:         16 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     32 * 1024 * 1024,
 	})
 	if err != nil {
 		return nil, err
@@ -563,58 +717,58 @@ func (ib *Inbound) dial() (*quicgo.Conn, error) {
 	return qconn, nil
 }
 
-// recvLoop 接受 outbound 主动开的 unidirectional stream，解析 Packet 命令
+// recvLoop 接收 outbound 通过 datagram 推回的 Packet 命令
+// 支持分片重组：fragTotal>1 时等所有片到齐后再回写本地
 func (ib *Inbound) recvLoop(qconn *quicgo.Conn) {
+	frags := make(map[fragKey]*fragBuf) // 分片重组缓冲（单 goroutine 访问，无需加锁）
 	for {
-		stream, err := qconn.AcceptUniStream(context.Background())
+		dgram, err := qconn.ReceiveDatagram(context.Background())
 		if err != nil {
 			return
 		}
-		go ib.handleRecvStream(stream)
-	}
-}
-
-func (ib *Inbound) handleRecvStream(stream *quicgo.ReceiveStream) {
-	r := &receiveStreamReader{s: stream}
-	defer (*stream).CancelRead(0)
-	(*stream).SetReadDeadline(time.Now().Add(idleTimeout))
-
-	// 读 VER + TYPE
-	hdr := make([]byte, 2)
-	if _, err := io.ReadFull(r, hdr); err != nil {
-		return
-	}
-	if hdr[0] != tuicVersion || hdr[1] != cmdPacket {
-		return
-	}
-
-	pkt, err := readPacket(r)
-	if err != nil {
-		return
-	}
-
-	// 按 assocID 找到对应的本地客户端地址
-	ib.sessionsMu.Lock()
-	var target *inSession
-	for _, s := range ib.sessions {
-		if s.assocID == pkt.assocID {
-			target = s
-			break
+		if len(dgram) < 2 || dgram[0] != tuicVersion || dgram[1] != cmdPacket {
+			continue
 		}
+		pkt, err := readPacketFromBytes(dgram)
+		if err != nil {
+			continue
+		}
+
+		// 清理超时分片
+		now := time.Now()
+		for k, fb := range frags {
+			if now.After(fb.deadline) {
+				delete(frags, k)
+			}
+		}
+
+		// 分片重组
+		data, ok := reassemblePkt(frags, pkt)
+		if !ok {
+			continue // 等待更多分片
+		}
+
+		ib.sessionsMu.Lock()
+		var target *inSession
+		for _, s := range ib.sessions {
+			if s.assocID == pkt.assocID {
+				target = s
+				break
+			}
+		}
+		ib.sessionsMu.Unlock()
+
+		if target == nil {
+			logger.Debug("[tuic-inbound] 收到未知assocID=%d的响应，忽略", pkt.assocID)
+			continue
+		}
+
+		target.touch()
+		ib.stats.bytesOut.Add(int64(len(data)))
+		ib.localConn.WriteToUDP(data, target.clientAddr)
+		logger.Debug("[tuic-inbound] ← Packet(dgram) assocID=%d pktID=%d size=%d → %s",
+			pkt.assocID, pkt.pktID, len(data), target.clientAddr)
 	}
-	ib.sessionsMu.Unlock()
-
-	if target == nil {
-		logger.Debug("[tuic-inbound] 收到未知assocID=%d的响应，忽略", pkt.assocID)
-		return
-	}
-
-	target.touch()
-	ib.stats.bytesOut.Add(int64(len(pkt.data)))
-	ib.localConn.WriteToUDP(pkt.data, target.clientAddr)
-
-	logger.Debug("[tuic-inbound] ← Packet assocID=%d pktID=%d size=%d → %s",
-		pkt.assocID, pkt.pktID, pkt.size, target.clientAddr)
 }
 
 // heartbeatLoop 有活跃 session 时定期发 TUIC v5 Heartbeat datagram
@@ -781,10 +935,14 @@ func (ob *Outbound) Run() error {
 	}
 
 	listener, err := quicgo.ListenAddr(ob.cfg.Listen, tlsCfg, &quicgo.Config{
-		MaxIdleTimeout:       idleTimeout,
-		KeepAlivePeriod:      15 * time.Second,
-		MaxIncomingUniStreams: 65535,
-		EnableDatagrams:      true,
+		MaxIdleTimeout:                 idleTimeout,
+		KeepAlivePeriod:                15 * time.Second,
+		MaxIncomingUniStreams:           65535,
+		EnableDatagrams:                true,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,
+		MaxStreamReceiveWindow:         16 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     32 * 1024 * 1024,
 	})
 	if err != nil {
 		return err
@@ -865,15 +1023,73 @@ func (ob *Outbound) handleConn(qconn *quicgo.Conn) {
 	cs.sessionsMu.Unlock()
 }
 
+// recvDatagrams 处理所有入站 datagram：Heartbeat 和 Packet 命令
+// 支持分片重组，直接在循环里处理减少 goroutine 开销
 func (cs *connState) recvDatagrams() {
+	frags := make(map[fragKey]*fragBuf) // 分片重组缓冲（单 goroutine 访问，无需加锁）
 	for {
-		data, err := cs.qconn.ReceiveDatagram(context.Background())
+		dgram, err := cs.qconn.ReceiveDatagram(context.Background())
 		if err != nil {
 			return
 		}
-		// TUIC v5 Heartbeat：| VER(1) | TYPE(1) |，忽略即可
-		if len(data) >= 2 && data[0] == tuicVersion && data[1] == cmdHeartbeat {
+		if len(dgram) < 2 || dgram[0] != tuicVersion {
+			continue
+		}
+		switch dgram[1] {
+		case cmdHeartbeat:
 			logger.Debug("[tuic-outbound] 收到Heartbeat")
+		case cmdPacket:
+			if !cs.authed.Load() {
+				logger.Warn("[tuic-outbound] 未认证连接发送Packet(dgram)，忽略")
+				continue
+			}
+			pkt, err := readPacketFromBytes(dgram)
+			if err != nil {
+				continue
+			}
+
+			// 清理超时分片
+			now := time.Now()
+			for k, fb := range frags {
+				if now.After(fb.deadline) {
+					delete(frags, k)
+				}
+			}
+
+			// 分片重组
+			data, ok := reassemblePkt(frags, pkt)
+			if !ok {
+				continue // 等待更多分片
+			}
+
+			cs.ob.stats.bytesIn.Add(int64(len(data)))
+			logger.Debug("[tuic-outbound] ← Packet(dgram) assocID=%d pktID=%d size=%d",
+				pkt.assocID, pkt.pktID, len(data))
+
+			cs.sessionsMu.Lock()
+			sess, ok2 := cs.sessions[pkt.assocID]
+			if !ok2 {
+				udpConn, err := net.DialUDP("udp", nil, cs.ob.targetAddr)
+				if err != nil {
+					cs.sessionsMu.Unlock()
+					logger.Error("[tuic-outbound] 创建UDP连接失败 assocID=%d: %v", pkt.assocID, err)
+					continue
+				}
+				sess = &outSession{
+					assocID:    pkt.assocID,
+					udpConn:    udpConn,
+					lastActive: time.Now(),
+				}
+				cs.sessions[pkt.assocID] = sess
+				logger.Debug("[tuic-outbound] 新session assocID=%d → %s", pkt.assocID, cs.ob.targetAddr)
+				go cs.recvFromTarget(pkt.assocID, sess)
+			}
+			cs.sessionsMu.Unlock()
+
+			sess.touch()
+			if _, err := sess.udpConn.Write(data); err != nil {
+				logger.Debug("[tuic-outbound] UDP发送失败 assocID=%d: %v", pkt.assocID, err)
+			}
 		}
 	}
 }
@@ -918,14 +1134,8 @@ func (cs *connState) handleStream(stream *quicgo.ReceiveStream) {
 	case cmdAuthenticate:
 		cs.handleAuth(r)
 	case cmdPacket:
-		if !cs.authed.Load() {
-			// 按规范：认证前收到其他命令，先缓冲，认证后再处理
-			// 简化：直接等待认证完成后处理
-			// 实际 anygo 场景下认证 stream 总是最先发，此处直接丢弃
-			logger.Warn("[tuic-outbound] 未认证连接发送Packet，忽略")
-			return
-		}
-		cs.handlePacket(r)
+		// Packet 命令已改为 datagram 传输，stream 里收到的忽略
+		logger.Debug("[tuic-outbound] 收到stream Packet，已改用datagram，忽略")
 	case cmdDissociate:
 		if !cs.authed.Load() {
 			return
@@ -1024,16 +1234,15 @@ func (cs *connState) recvFromTarget(assocID uint16, sess *outSession) {
 		default:
 		}
 
-		sess.udpConn.SetReadDeadline(time.Now().Add(sessionIdle))
 		n, srcAddr, err := sess.udpConn.ReadFromUDP(buf)
 		if err != nil {
 			return
 		}
 
 		sess.touch()
-		data := make([]byte, n)
-		copy(data, buf[:n])
 		cs.ob.stats.bytesOut.Add(int64(n))
+		// 直接用 buf 切片，writePacketBytes 内部会 copy 数据
+		data := buf[:n]
 
 		// 构造响应 Packet 命令，ADDR 填真实源地址
 		var addr tuicAddr
@@ -1054,21 +1263,13 @@ func (cs *connState) recvFromTarget(assocID uint16, sess *outSession) {
 		}
 		pktID++
 
-		// 开一条 unidirectional stream 发回客户端
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		stream, err := cs.qconn.OpenUniStreamSync(ctx)
-		cancel()
-		if err != nil {
-			logger.Debug("[tuic-outbound] 开单向stream失败 assocID=%d: %v", assocID, err)
+		// 通过 datagram 推回 inbound（超过 maxDatagramPayload 自动分片）
+		if err := sendDatagramPkt(cs.qconn, pkt); err != nil {
+			logger.Debug("[tuic-outbound] 发送Datagram失败 assocID=%d: %v", assocID, err)
 			return
 		}
-		if err := writePacket(stream, pkt); err != nil {
-			stream.Close()
-			return
-		}
-		stream.Close()
 
-		logger.Debug("[tuic-outbound] → Packet assocID=%d pktID=%d size=%d src=%s",
+		logger.Debug("[tuic-outbound] → Packet(dgram) assocID=%d pktID=%d size=%d src=%s",
 			assocID, pkt.pktID, n, srcAddr)
 	}
 }
