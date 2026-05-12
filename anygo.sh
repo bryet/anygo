@@ -21,14 +21,14 @@ raw_conf_path="$work_dir/rawconf"
 version_file="$work_dir/version"
 github_repo="bryet/anygo"
 
-check_root() {
+check_root(){
     if [ "$(id -u)" != "0" ]; then
         echo -e "${Error} 当前非ROOT账号(或没有ROOT权限)，无法继续操作，请更换ROOT账号或使用 ${Green_globa}sudo -i${Nc} 命令获取临时ROOT权限（执行后可能会提示输入当前账号的密码）。"
         exit 1
     fi
 }
 
-check_arch() {
+check_arch(){
     arch=$(uname -m)
     case "$arch" in
         x86_64|x64|amd64)
@@ -54,7 +54,7 @@ check_arch() {
     echo -e "${Info} 检测到架构: ${Green}$arch${Nc}"
 }
 
-check_release() {
+check_release(){
     if [[ -e /etc/os-release ]]; then
         . /etc/os-release
         release=$ID
@@ -73,7 +73,7 @@ check_release() {
     fi
 }
 
-check_pmc() {
+check_pmc(){
     check_release
     case "$release" in
         debian|ubuntu|kali)
@@ -108,7 +108,7 @@ check_pmc() {
     esac
 }
 
-install_base() {
+install_base(){
     check_pmc
     cmds=("wget" "curl" "tar")
     echo -e "${Info} 你的系统是 ${Red}$release $os_version${Nc}"
@@ -129,7 +129,7 @@ install_base() {
     fi
 }
 
-check_new_ver() {
+check_new_ver(){
     new_ver=$(curl -Ls "https://api.github.com/repos/${github_repo}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     if [[ -z ${new_ver} ]]; then
         echo -e "${Error} anygo 最新版本获取失败，请检查网络"
@@ -139,7 +139,7 @@ check_new_ver() {
     fi
 }
 
-check_installed_ver() {
+check_installed_ver(){
     if [ -f "$version_file" ]; then
         installed_ver=$(cat "$version_file")
         echo -e "${Info} 当前安装的 anygo 版本: ${Green}${installed_ver}${Nc}"
@@ -148,7 +148,7 @@ check_installed_ver() {
     fi
 }
 
-download_anygo() {
+download_anygo(){
     local ver=$1
     local dl_url="https://github.com/${github_repo}/releases/download/${ver}/anygo-linux-${arch}.tar.gz"
     local tarball="anygo-linux-${arch}.tar.gz"
@@ -165,7 +165,7 @@ download_anygo() {
     echo "$ver" >"$version_file"
 }
 
-Install_anygo() {
+Install_anygo(){
     check_root
     install_base
     check_arch
@@ -210,7 +210,7 @@ Install_anygo() {
     fi
 }
 
-Update_anygo() {
+Update_anygo(){
     check_root
     check_arch
 
@@ -257,7 +257,7 @@ Update_anygo() {
     echo -e "${Info} anygo 已更新至 v${new_ver}"
 }
 
-Uninstall_anygo() {
+Uninstall_anygo(){
     check_root
     echo -e "${Yellow}================================${Nc}"
     echo -e "${Red}警告: 即将卸载 anygo!${Nc}"
@@ -278,7 +278,7 @@ Uninstall_anygo() {
     echo -e "${Info} anygo 已成功卸载"
 }
 
-Start_anygo() {
+Start_anygo(){
     check_root
     if [ ! -f "$service_path" ]; then
         echo -e "${Error} anygo 服务文件不存在，请先安装"
@@ -292,13 +292,13 @@ Start_anygo() {
     fi
 }
 
-Stop_anygo() {
+Stop_anygo(){
     check_root
     systemctl stop anygo 2>/dev/null
     echo -e "${Info} anygo 已停止"
 }
 
-Restart_anygo() {
+Restart_anygo(){
     check_root
     if [ ! -f "$service_path" ]; then
         echo -e "${Error} anygo 服务文件不存在，请先安装"
@@ -310,7 +310,7 @@ Restart_anygo() {
     fi
 }
 
-Status_anygo() {
+Status_anygo(){
     if systemctl is-active --quiet anygo 2>/dev/null; then
         echo -e "${Info} anygo 运行状态: ${Green}运行中${Nc}"
         systemctl status anygo --no-pager -l 2>/dev/null || true
@@ -319,7 +319,7 @@ Status_anygo() {
     fi
 }
 
-View_log() {
+View_log(){
     local log_file="$work_dir/anygo.log"
     if [ -f "$log_file" ]; then
         echo -e "${Info} 按 ${Red}Ctrl+C${Nc} 退出日志查看"
@@ -335,7 +335,7 @@ View_log() {
 # rawconf format: mode|listen|remote|sni|password|max_conns|insecure|cert|key|remarks
 # mode: client / server
 
-read_tunnel_mode() {
+read_tunnel_mode(){
     echo -e "-----------------------------------"
     echo -e "请选择隧道模式: "
     echo -e "-----------------------------------"
@@ -355,7 +355,7 @@ read_tunnel_mode() {
     esac
 }
 
-read_listen() {
+read_listen(){
     echo -e "-----------------------------------"
     echo -e "请问你要将本机哪个端口接收到的流量进行转发?"
     read -p "请输入: " flag_port
@@ -363,7 +363,7 @@ read_listen() {
     flag_listen="[::]:${flag_port}"
 }
 
-read_remote() {
+read_remote(){
     echo -e "-----------------------------------"
     echo -e "请问你要将本机从${Green}${flag_port}${Nc}接收到的流量转发向哪个IP或域名?"
     read -p "请输入: " flag_addr
@@ -375,12 +375,12 @@ read_remote() {
     flag_remote="${flag_addr}:${flag_remote_port}"
 }
 
-write_rawconf() {
+write_rawconf(){
     # format: mode|listen|remote
     echo "${flag_mode}|${flag_listen}|${flag_remote}" >>"$raw_conf_path"
 }
 
-Add_tunnel() {
+Add_tunnel(){
     check_root
     read_tunnel_mode
     read_listen
@@ -411,7 +411,7 @@ Add_tunnel() {
     show_all_conf
 }
 
-generate_yaml_config() {
+generate_yaml_config(){
     cat > "$config_path" <<'YAMLHEADER'
 log_level: "info"
 
@@ -459,7 +459,7 @@ TUNNEL
     done <"$raw_conf_path"
 }
 
-show_all_conf() {
+show_all_conf(){
     echo -e "                      ${Green}Anygo 隧道配置${Nc}"
     echo -e "--------------------------------------------------------"
     echo -e "序号|   模式   |   监听地址    |   目标地址"
@@ -485,7 +485,7 @@ show_all_conf() {
     done <"$raw_conf_path"
 }
 
-Delete_tunnel() {
+Delete_tunnel(){
     check_root
     if [ ! -s "$raw_conf_path" ]; then
         echo -e "${Error} 当前没有任何隧道配置"
@@ -514,7 +514,7 @@ Delete_tunnel() {
 
 # ============ Main Menu ============
 
-main_menu() {
+main_menu(){
     clear
     echo && echo -e "                 ${Green}Anygo 一键安装配置脚本${Nc}"
     echo -e "  ${Blue}-----------------------------------------------------${Nc}"
