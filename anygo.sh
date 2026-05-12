@@ -202,7 +202,7 @@ Install_anygo() {
     systemctl enable anygo
 
     if [ -f "$anygo_bin" ] && [ -f "$service_path" ] && [ -f "$config_path" ]; then
-        echo -e "${Info} anygo v${new_ver} 安装成功！"
+        echo -e "${Info} anygo ${new_ver} 安装成功！"
         echo -e "${Tip} 使用 ${Green}systemctl start anygo${Nc} 启动服务"
     else
         echo -e "${Error} anygo 安装失败，请检查"
