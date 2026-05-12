@@ -523,8 +523,6 @@ main_menu() {
     echo -e "        (3) 机器重启后转发不失效"
     echo -e "        (4) 支持 TLS 加密伪装 (SNI)"
     echo -e "  ${Blue}-----------------------------------------------------${Nc}"
-    echo -e "  项目地址: ${Green}https://github.com/${github_repo}${Nc}"
-    echo -e "  ${Blue}-----------------------------------------------------${Nc}"
 
     if [ -f "$anygo_bin" ]; then
         if systemctl is-active --quiet anygo 2>/dev/null; then
