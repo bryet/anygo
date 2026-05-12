@@ -825,8 +825,19 @@ main_menu() {
     echo -e "        (3) 机器重启后转发不失效"
     echo -e "        (4) 支持 TLS 加密伪装 (SNI)"
     echo -e "  ${Blue}-----------------------------------------------------${Nc}"
-    echo -e "  项目地址: ${Green}${github_repo}${Nc}"
+    echo -e "  项目地址: ${Green}https://github.com/${github_repo}${Nc}"
     echo -e "  ${Blue}-----------------------------------------------------${Nc}"
+
+    if [ -f "$anygo_bin" ]; then
+        if systemctl is-active --quiet anygo 2>/dev/null; then
+            echo -e "  当前状态: ${Green}已安装${Nc} 并 ${Green}已启动${Nc}"
+        else
+            echo -e "  当前状态: ${Green}已安装${Nc} 但 ${Red}未启动${Nc}"
+        fi
+    else
+        echo -e "  当前状态: ${Red}未安装${Nc}"
+    fi
+
     echo
     echo -e " ${Green}1.${Nc} 安装 anygo"
     echo -e " ${Green}2.${Nc} 更新 anygo"
