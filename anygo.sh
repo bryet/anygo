@@ -171,7 +171,7 @@ Install_anygo() {
     check_arch
     check_new_ver
 
-    echo -e "${Tip} 即将安装 anygo v${new_ver}"
+    echo -e "${Tip} 即将安装 anygo ${new_ver}"
     download_anygo "$new_ver"
 
     # Stop existing service
