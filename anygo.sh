@@ -132,8 +132,9 @@ install_base(){
 check_new_ver(){
     new_ver=$(curl -Ls "https://api.github.com/repos/${github_repo}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     if [[ -z ${new_ver} ]]; then
-        echo -e "${Error} anygo 最新版本获取失败，请检查网络"
-        exit 1
+        echo -e "${Error} anygo 最新版本获取失败，请手动输入版本号"
+        echo
+        read -e -p "请输入版本号:" new_ver
     else
         echo -e "${Info} anygo 目前最新版本为 ${Green}${new_ver}${Nc}"
     fi
@@ -150,8 +151,23 @@ check_installed_ver(){
 
 download_anygo(){
     local ver=$1
-    local dl_url="https://github.com/${github_repo}/releases/download/${ver}/anygo-linux-${arch}.tar.gz"
     local tarball="anygo-linux-${arch}.tar.gz"
+
+    if [[ -z ${ver} ]]; then
+        check_new_ver
+        ver="$new_ver"
+        echo -e "${Tip} 若为国内机器建议使用大陆镜像加速下载"
+        read -e -p "是否使用？[y/N]:" use_mirror
+        [[ -z ${use_mirror} ]] && use_mirror="n"
+        if [[ ${use_mirror} == [Yy] ]]; then
+            dl_url="https://gh-proxy.org/github.com/${github_repo}/releases/download/${ver}/anygo-linux-${arch}.tar.gz"
+        else
+            dl_url="https://github.com/${github_repo}/releases/download/${ver}/anygo-linux-${arch}.tar.gz"
+        fi
+    else
+        dl_url="https://gh-proxy.org/github.com/${github_repo}/releases/download/${ver}/anygo-linux-${arch}.tar.gz"
+    fi
+
     echo -e "${Info} 正在从 ${Blue}${dl_url}${Nc} 下载 anygo..."
     mkdir -p "$work_dir"
     cd "$work_dir"
@@ -167,12 +183,22 @@ download_anygo(){
 
 Install_anygo(){
     check_root
+
+    if [ -f "$anygo_bin" ]; then
+        echo -e "${Tip} anygo 已安装，无需安装"
+        return
+    fi
+
     install_base
     check_arch
-    check_new_ver
 
-    echo -e "${Tip} 即将安装 anygo ${new_ver}"
-    download_anygo "$new_ver"
+    if [[ -n $1 ]]; then
+        echo -e "${Info} anygo 指定版本为 ${Green}$1${Nc}"
+        echo -e "${Tip} 即将安装 anygo $1"
+    else
+        echo -e "${Tip} 即将安装 anygo"
+    fi
+    download_anygo "$1"
 
     # Stop existing service
     systemctl stop anygo 2>/dev/null
@@ -221,7 +247,13 @@ Update_anygo(){
     fi
 
     check_installed_ver
-    check_new_ver
+
+    if [[ -n $1 ]]; then
+        new_ver="$1"
+        echo -e "${Info} anygo 指定版本为 ${Green}$1${Nc}"
+    else
+        check_new_ver
+    fi
 
     if [ "$installed_ver" == "$new_ver" ]; then
         echo -e "${Info} 已经是最新版本 v${new_ver}，无需更新"
@@ -255,11 +287,17 @@ Update_anygo(){
 
     systemctl start anygo 2>/dev/null
 
-    echo -e "${Info} anygo 已更新至 v${new_ver}"
+    echo -e "${Info} anygo 已更新至 ${new_ver}"
 }
 
 Uninstall_anygo(){
     check_root
+
+    if [ ! -f "$anygo_bin" ]; then
+        echo -e "${Error} anygo 尚未安装，无需卸载"
+        return
+    fi
+
     echo -e "${Yellow}================================${Nc}"
     echo -e "${Red}警告: 即将卸载 anygo!${Nc}"
     echo -e "${Yellow}================================${Nc}"
@@ -595,10 +633,10 @@ main_menu(){
 # 支持命令行参数
 case "$1" in
     install)
-        Install_anygo
+        Install_anygo "$2"
         ;;
     update)
-        Update_anygo
+        Update_anygo "$2"
         ;;
     uninstall)
         Uninstall_anygo
