@@ -264,7 +264,7 @@ Update_anygo(){
         fi
     fi
 
-    echo -e "${Tip} 即将更新 anygo: v${installed_ver} -> v${new_ver}"
+    echo -e "${Tip} 即将更新 anygo: ${installed_ver} -> ${new_ver}"
     read -e -p "确认更新？[y/n]:" confirm
     [[ -z ${confirm} ]] && confirm="n"
     if [[ ${confirm} != [Yy] ]]; then
@@ -378,11 +378,11 @@ read_tunnel_mode(){
     echo -e "-----------------------------------"
     echo -e "请选择隧道模式: "
     echo -e "-----------------------------------"
-    echo -e "[1] ${Green}客户端模式${Nc} (加密转发)"
+    echo -e "[1] ${Green}加密转发${Nc} (客户端模式)"
     echo -e "    说明: 监听本地端口，通过TLS隧道转发到远程服务器"
     echo -e "    适用于: 国内中转机 -> 境外服务器"
     echo -e "-----------------------------------"
-    echo -e "[2] ${Green}服务端模式${Nc} (解密接收)"
+    echo -e "[2] ${Green}解密接收${Nc} (服务端模式)"
     echo -e "    说明: 接收TLS加密流量，解密后转发到目标地址"
     echo -e "    适用于: 境外服务器接收并解密 -> 转发到落地代理"
     echo -e "-----------------------------------"
@@ -501,7 +501,7 @@ TUNNEL
 show_all_conf(){
     echo -e "                      ${Green}Anygo 隧道配置${Nc}"
     echo -e "--------------------------------------------------------"
-    echo -e "序号|   模式   |   监听地址    |   目标地址"
+    echo -e " 序号|   模式   |   监听地址    |   目标地址"
     echo -e "--------------------------------------------------------"
 
     if [ ! -s "$raw_conf_path" ]; then
@@ -514,11 +514,11 @@ show_all_conf(){
     while IFS='|' read -r mode listen remote; do
         [ -z "$mode" ] && continue
         if [ "$mode" == "client" ]; then
-            mode_str="客户端"
+            mode_str="加密转发"
         else
-            mode_str="服务端"
+            mode_str="解密接收"
         fi
-        echo -e " $i   | ${mode_str} | ${listen} | ${remote}"
+        echo -e " $i   | ${mode_str} |  ${listen}   | ${remote}"
         echo -e "--------------------------------------------------------"
         i=$((i + 1))
     done <"$raw_conf_path"
