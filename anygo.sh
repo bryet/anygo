@@ -403,7 +403,7 @@ Add_tunnel(){
     read_remote
 
     flag_sni="bing.com"
-    flag_password="lMgab3FiW55df4gd5s15as"
+    flag_password="8f0ea803433fbc6a8fa0689313d9d8e3"
     flag_max_conns="0"
     flag_remarks=""
 
@@ -460,7 +460,7 @@ YAMLHEADER
   - listen: "${listen}"
     remote: "${remote}"
     sni: "bing.com"
-    password: "lMgab3FiW5"
+    password: "8f0ea803433fbc6a8fa0689313d9d8e3"
     max_conns: 0
 TUNNEL
 
