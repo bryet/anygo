@@ -224,6 +224,7 @@ Install_anygo(){
 
     if [ -f "$anygo_bin" ] && [ -f "$service_path" ] && [ -f "$config_path" ]; then
         echo -e "${Info} anygo 安装成功！"
+        openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -subj "/C=CN/ST=GD/L=SZ/O=Dev/OU=IT/CN=bing.com" -days 3650 &> /dev/null
         sleep 3s
         main_menu
     else
