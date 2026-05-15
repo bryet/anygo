@@ -154,7 +154,6 @@ download_anygo(){
     local tarball="anygo-linux-${arch}.tar.gz"
 
     if [[ -z ${ver} ]]; then
-        check_new_ver
         ver="$new_ver"
         echo -e "${Tip} 若为国内机器建议使用大陆镜像加速下载"
         read -e -p "是否使用？[y/N]:" use_mirror
@@ -198,6 +197,7 @@ Install_anygo(){
     else
         echo -e "${Tip} 即将安装 anygo"
     fi
+    check_new_ver
     download_anygo "$1"
 
     # Stop existing service
