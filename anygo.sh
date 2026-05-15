@@ -192,21 +192,18 @@ Install_anygo(){
     check_arch
 
     if [[ -n $1 ]]; then
-        echo -e "${Info} anygo 指定版本为 ${Green}$1${Nc}"
-        echo -e "${Tip} 即将安装 anygo $1"
+        echo -e "${Tip} 即将安装 anygo ${Green}$1${Nc}"
     else
-        echo -e "${Tip} 即将安装 anygo"
+        check_new_ver
+        echo -e "${Tip} 即将安装 anygo ${Green}${new_ver}${Nc}"
     fi
-    check_new_ver
+    
     download_anygo "$1"
 
-    # Stop existing service
     systemctl stop anygo 2>/dev/null
 
-    # Install binary (already extracted in work_dir)
     chmod +x "$anygo_bin"
 
-    # Install service from existing template
     if [ -f "$work_dir/anygo.service" ]; then
         cp -f "$work_dir/anygo.service" "$service_path"
     else
@@ -214,12 +211,10 @@ Install_anygo(){
         exit 1
     fi
 
-    # Copy default config if not exists
     if [ ! -f "$config_path" ] && [ -f "$work_dir/config.yaml" ]; then
         cp -f "$work_dir/config.yaml" "$config_path"
     fi
 
-    # Create rawconf if not exists
     if [ ! -f "$raw_conf_path" ]; then
         touch "$raw_conf_path"
     fi
@@ -228,7 +223,7 @@ Install_anygo(){
     systemctl enable anygo
 
     if [ -f "$anygo_bin" ] && [ -f "$service_path" ] && [ -f "$config_path" ]; then
-        echo -e "${Info} anygo ${new_ver} 安装成功！"
+        echo -e "${Info} anygo 安装成功！"
         sleep 3s
         main_menu
     else
@@ -262,7 +257,6 @@ Update_anygo(){
         return
     fi
 
-    # Backup config to /tmp before update
     cp -f "$config_path" /tmp/config.yaml 2>/dev/null
     cp -f "$raw_conf_path" /tmp/rawconf 2>/dev/null
 
@@ -270,7 +264,6 @@ Update_anygo(){
     systemctl stop anygo 2>/dev/null
     chmod +x "$anygo_bin"
 
-    # Restore config from /tmp
     cp -f /tmp/config.yaml "$config_path" 2>/dev/null
     cp -f /tmp/rawconf "$raw_conf_path" 2>/dev/null
     rm -f /tmp/config.yaml /tmp/rawconf
@@ -359,11 +352,6 @@ View_log(){
     fi
 }
 
-# ============ Config Management ============
-
-# rawconf format: mode|listen|remote|sni|password|max_conns|insecure|cert|key|remarks
-# mode: client / server
-
 read_tunnel_mode(){
     echo -e "-----------------------------------"
     echo -e "请选择隧道模式: "
@@ -405,7 +393,6 @@ read_remote(){
 }
 
 write_rawconf(){
-    # format: mode|listen|remote
     echo "${flag_mode}|${flag_listen}|${flag_remote}" >>"$raw_conf_path"
 }
 
@@ -415,9 +402,8 @@ Add_tunnel(){
     read_listen
     read_remote
 
-    # Hardcoded defaults
     flag_sni="bing.com"
-    flag_password="lMgab3FiW5"
+    flag_password="lMgab3FiW55df4gd5s15as"
     flag_max_conns="0"
     flag_remarks=""
 
@@ -427,8 +413,8 @@ Add_tunnel(){
         flag_key=""
     else
         flag_insecure="false"
-        flag_cert="$work_dir/server.crt"
-        flag_key="$work_dir/server.key"
+        flag_cert="$work_dir/cert.pem"
+        flag_key="$work_dir/key.pem"
     fi
 
     write_rawconf
@@ -481,8 +467,8 @@ TUNNEL
         if [ "$mode" == "client" ]; then
             echo "    insecure: true" >>"$config_path"
         else
-            echo "    cert: \"$work_dir/server.crt\"" >>"$config_path"
-            echo "    key: \"$work_dir/server.key\"" >>"$config_path"
+            echo "    cert: \"$work_dir/cert.pem\"" >>"$config_path"
+            echo "    key: \"$work_dir/key.pem\"" >>"$config_path"
         fi
         echo "" >>"$config_path"
     done <"$raw_conf_path"
@@ -541,7 +527,6 @@ Delete_tunnel(){
     echo -e "${Info} 配置已删除，服务已重启"
 }
 
-# ============ Main Menu ============
 
 main_menu(){
     clear
@@ -620,11 +605,8 @@ main_menu(){
     esac
 }
 
-# ============ 主入口 ============
 if [[ -n "$1" ]]; then
-    # 带参数（版本号）直接安装，使用加速
     Install_anygo "$1"
 else
-    # 无参数进入菜单
     main_menu
 fi
