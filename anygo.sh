@@ -79,27 +79,27 @@ check_pmc(){
         debian|ubuntu|kali)
             updates="apt update -y"
             installs="apt install -y"
-            apps=("wget" "curl" "tar")
+            apps=("wget" "curl" "tar" "openssl")
             ;;
         almalinux|centos|rocky|oracle|fedora)
             updates="dnf update -y"
             installs="dnf install -y"
-            apps=("wget" "curl" "tar")
+            apps=("wget" "curl" "tar" "openssl")
             ;;
         opensuse-tumbleweed)
             updates="zypper refresh"
             installs="zypper install -y"
-            apps=("wget" "curl" "tar")
+            apps=("wget" "curl" "tar" "openssl")
             ;;
         arch|manjaro|parch)
             updates="pacman -Syu"
             installs="pacman -Syu --noconfirm"
-            apps=("wget" "curl" "tar")
+            apps=("wget" "curl" "tar" "openssl")
             ;;
         alpine)
             updates="apk update"
             installs="apk add"
-            apps=("wget" "curl" "tar")
+            apps=("wget" "curl" "tar" "openssl")
             ;;
         *)
             echo -e "${Error} 不支持的发行版: $release"
@@ -110,7 +110,7 @@ check_pmc(){
 
 install_base(){
     check_pmc
-    cmds=("wget" "curl" "tar")
+    cmds=("wget" "curl" "tar" "openssl")
     echo -e "${Info} 你的系统是 ${Red}$release $os_version${Nc}"
     echo
 
