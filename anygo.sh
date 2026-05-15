@@ -247,21 +247,11 @@ Update_anygo(){
     fi
 
     check_installed_ver
-
-    if [[ -n $1 ]]; then
-        new_ver="$1"
-        echo -e "${Info} anygo 指定版本为 ${Green}$1${Nc}"
-    else
-        check_new_ver
-    fi
+    check_new_ver
 
     if [ "$installed_ver" == "$new_ver" ]; then
-        echo -e "${Info} 已经是最新版本 v${new_ver}，无需更新"
-        read -e -p "是否强制重新安装？[y/n]:" force_update
-        [[ -z ${force_update} ]] && force_update="n"
-        if [[ ${force_update} != [Yy] ]]; then
-            return
-        fi
+        echo -e "${Info} 已经是最新版本${Green}${new_ver}${Nc}，无需更新"
+        exit 1
     fi
 
     echo -e "${Tip} 即将更新 anygo: ${installed_ver} -> ${new_ver}"
@@ -276,7 +266,7 @@ Update_anygo(){
     cp -f "$config_path" /tmp/config.yaml 2>/dev/null
     cp -f "$raw_conf_path" /tmp/rawconf 2>/dev/null
 
-    download_anygo "$new_ver"
+    download_anygo
     systemctl stop anygo 2>/dev/null
     chmod +x "$anygo_bin"
 
@@ -630,42 +620,11 @@ main_menu(){
     esac
 }
 
-# 支持命令行参数
-case "$1" in
-    install)
-        Install_anygo "$2"
-        ;;
-    update)
-        Update_anygo "$2"
-        ;;
-    uninstall)
-        Uninstall_anygo
-        ;;
-    start)
-        Start_anygo
-        ;;
-    stop)
-        Stop_anygo
-        ;;
-    restart)
-        Restart_anygo
-        ;;
-    status)
-        Status_anygo
-        ;;
-    log)
-        View_log
-        ;;
-    add)
-        Add_tunnel
-        ;;
-    list)
-        show_all_conf
-        ;;
-    delete)
-        Delete_tunnel
-        ;;
-    *)
-        main_menu
-        ;;
-esac
+# ============ 主入口 ============
+if [[ -n "$1" ]]; then
+    # 带参数（版本号）直接安装，使用加速
+    Install_anygo "$1"
+else
+    # 无参数进入菜单
+    main_menu
+fi
