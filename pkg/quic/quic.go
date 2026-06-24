@@ -1,23 +1,25 @@
 package quic
 
-// anygo UDP 隧道 —— 完全对标 TUIC v5 协议
+// anygo UDP tunnel — fully aligned with TUIC v5 protocol
 //
-// 链路：
-//   本地UDP流量
-//     ↓ 普通 UDP 包
-//   inbound（扮演 TUIC v5 客户端）
-//     ↓ 标准 TUIC v5 协议（QUIC + anygo-quic ALPN）
-//   outbound（扮演 TUIC v5 服务端）
-//     ↓ 普通 UDP 包
-//   目标 UDP 节点
+// data flow:
+//   local UDP traffic
+//     ↓ plain UDP packet
+//   inbound (acts as TUIC v5 client)
+//     ↓ standard TUIC v5 protocol (QUIC + anygo-quic ALPN)
+//   outbound (acts as TUIC v5 server)
+//     ↓ plain UDP packet
+//   target UDP node
 //
-// TUIC v5 协议规范：https://github.com/tuic-protocol/tuic/blob/master/SPEC.md
+// TUIC v5 protocol spec: https://github.com/tuic-protocol/tuic/blob/master/SPEC.md
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,34 +29,44 @@ import (
 
 	"anygo/config"
 	"anygo/pkg/logger"
+	"anygo/pkg/util"
 
 	quicgo "github.com/quic-go/quic-go"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TUIC v5 协议常量
+// TUIC v5 protocol constants
 // ─────────────────────────────────────────────────────────────────────────────
+
+// udpBufPool reuses large UDP read buffers to reduce GC pressure.
+// Get/Put pattern: buf := udpBufPool.Get().([]byte); defer udpBufPool.Put(buf[:udpBufSize])
+var udpBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, udpBufSize)
+		return b
+	},
+}
 
 const (
 	tuicVersion = 0x05
 
-	// 命令类型
+	// command types
 	cmdAuthenticate = 0x00
 	cmdConnect      = 0x01
 	cmdPacket       = 0x02
 	cmdDissociate   = 0x03
 	cmdHeartbeat    = 0x04
 
-	// 地址类型
+	// address types
 	addrNone   = 0xff
 	addrDomain = 0x00
 	addrIPv4   = 0x01
 	addrIPv6   = 0x02
 
-	// anygo 使用的 QUIC ALPN（与外部 TUIC 节点区分）
+	// QUIC ALPN used by anygo (distinct from external TUIC nodes)
 	quicALPN = "anygo-quic"
 
-	// 超时
+	// timeouts
 	dialTimeout    = 10 * time.Second
 	idleTimeout    = 120 * time.Second
 	sessionIdle    = 60 * time.Second
@@ -62,13 +74,13 @@ const (
 
 	udpBufSize = 65535
 
-	// QUIC datagram 单帧最大载荷（保守值，留出 TUIC 头部 + QUIC 帧开销）
-	// 超过此大小的 UDP 包自动拆片，接收端重组
+	// max QUIC datagram payload (conservative; reserves space for TUIC header + QUIC frame overhead)
+	// UDP packets larger than this are automatically fragmented and reassembled on the receive side
 	maxDatagramPayload = 1100
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TUIC v5 地址编解码
+// TUIC v5 address codec
 // ─────────────────────────────────────────────────────────────────────────────
 
 type tuicAddr struct {
@@ -120,7 +132,7 @@ func readAddr(r io.Reader) (tuicAddr, error) {
 		}
 		a.port = binary.BigEndian.Uint16(portBuf)
 	default:
-		return tuicAddr{}, fmt.Errorf("未知地址类型: 0x%02x", a.typ)
+		return tuicAddr{}, fmt.Errorf("unknown address type: 0x%02x", a.typ)
 	}
 	return a, nil
 }
@@ -159,7 +171,7 @@ func writeAddr(w io.Writer, a tuicAddr) error {
 		_, err := w.Write(buf)
 		return err
 	}
-	return fmt.Errorf("未知地址类型: 0x%02x", a.typ)
+	return fmt.Errorf("unknown address type: 0x%02x", a.typ)
 }
 
 func udpAddrToTUIC(a *net.UDPAddr) tuicAddr {
@@ -170,12 +182,12 @@ func udpAddrToTUIC(a *net.UDPAddr) tuicAddr {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TUIC v5 Packet 命令
+// TUIC v5 Packet command
 //
-// 帧格式（unidirectional stream）：
-//   客户端→服务端：| VER(1) | TYPE(1) | ASSOC_ID(2) | PKT_ID(2) |
+// frame format (unidirectional stream):
+//   client→server：| VER(1) | TYPE(1) | ASSOC_ID(2) | PKT_ID(2) |
 //                  | FRAG_TOTAL(1) | FRAG_ID(1) | SIZE(2) | ADDR | DATA |
-//   服务端→客户端：同上，ADDR 为源地址
+//   server→client：same as above; ADDR is the source address
 // ─────────────────────────────────────────────────────────────────────────────
 
 type tuicPacket struct {
@@ -188,8 +200,8 @@ type tuicPacket struct {
 	data      []byte
 }
 
-// readPacket 从 unidirectional stream 读取一个完整 Packet 命令
-// 调用前 VER+TYPE 两字节已读
+// readPacket reads a complete Packet command from a unidirectional stream
+// VER+TYPE header bytes must be read before calling
 func readPacket(r io.Reader) (tuicPacket, error) {
 	hdr := make([]byte, 2+2+1+1+2) // assocID+pktID+fragTotal+fragID+size
 	if _, err := io.ReadFull(r, hdr); err != nil {
@@ -214,7 +226,7 @@ func readPacket(r io.Reader) (tuicPacket, error) {
 	return pkt, nil
 }
 
-// writePacket 写出完整 Packet 命令帧（含 VER+TYPE 头）
+// writePacket writes a complete Packet command frame (including VER+TYPE header)
 func writePacket(w io.Writer, pkt tuicPacket) error {
 	hdr := make([]byte, 1+1+2+2+1+1+2)
 	hdr[0] = tuicVersion
@@ -235,16 +247,16 @@ func writePacket(w io.Writer, pkt tuicPacket) error {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 分片发送 & 重组（TUIC v5 native 模式）
+// fragmentation & reassembly (TUIC v5 native mode) (TUIC v5 native mode)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// fragKey 分片重组缓冲的索引 key
+// fragKey is the index key for fragment reassembly buffers
 type fragKey struct {
 	assocID uint16
 	pktID   uint16
 }
 
-// fragBuf 分片重组缓冲
+// fragBuf is a fragment reassembly buffer
 type fragBuf struct {
 	total    uint8
 	received uint8
@@ -252,8 +264,8 @@ type fragBuf struct {
 	deadline time.Time
 }
 
-// sendDatagramPkt 发送一个 Packet 命令
-// 若数据超过 maxDatagramPayload，自动拆片，每片各发一个 datagram
+// sendDatagramPkt sends a Packet command
+// if data exceeds maxDatagramPayload, auto-fragment and send each piece as a separate datagram
 func sendDatagramPkt(qconn *quicgo.Conn, pkt tuicPacket) error {
 	if len(pkt.data) <= maxDatagramPayload {
 		dgram, err := writePacketBytes(pkt)
@@ -276,7 +288,7 @@ func sendDatagramPkt(qconn *quicgo.Conn, pkt tuicPacket) error {
 		}
 		addr := tuicAddr{typ: addrNone, port: 0}
 		if i == 0 {
-			addr = pkt.addr // 第一片携带原始地址
+			addr = pkt.addr // the first fragment carries the original address
 		}
 		frag := tuicPacket{
 			assocID:   pkt.assocID,
@@ -298,12 +310,12 @@ func sendDatagramPkt(qconn *quicgo.Conn, pkt tuicPacket) error {
 	return nil
 }
 
-// reassemblePkt 将收到的 pkt 加入分片缓冲，若所有片到齐则返回重组后的完整数据
-// frags 由调用方管理（单 goroutine），无需加锁
-// 返回 (data, true) 表示重组完成；(nil, false) 表示等待更多片
+// reassemblePkt adds a received pkt to the fragment buffer; returns the reassembled data when all fragments arrive
+// frags is managed by the caller (single goroutine), no locking needed
+// returns (data, true) when reassembly is complete; (nil, false) when waiting for more fragments
 func reassemblePkt(frags map[fragKey]*fragBuf, pkt tuicPacket) ([]byte, bool) {
 	if pkt.fragTotal == 1 {
-		// 不分片，直接返回（copy 防止底层 slice 被重用）
+		// no fragmentation, return directly (copy to prevent underlying slice reuse)
 		data := make([]byte, len(pkt.data))
 		copy(data, pkt.data)
 		return data, true
@@ -319,7 +331,7 @@ func reassemblePkt(frags map[fragKey]*fragBuf, pkt tuicPacket) ([]byte, bool) {
 		}
 		frags[key] = fb
 	}
-	// 保存分片（copy 防止底层复用）
+	// store fragment (copy to prevent underlying data reuse)
 	buf := make([]byte, len(pkt.data))
 	copy(buf, pkt.data)
 	fb.frags[pkt.fragID] = buf
@@ -329,7 +341,7 @@ func reassemblePkt(frags map[fragKey]*fragBuf, pkt tuicPacket) ([]byte, bool) {
 		return nil, false
 	}
 
-	// 所有片到齐，按 fragID 顺序拼接
+	// all fragments arrived; concatenate in fragID order
 	var full []byte
 	for i := uint8(0); i < fb.total; i++ {
 		full = append(full, fb.frags[i]...)
@@ -338,9 +350,9 @@ func reassemblePkt(frags map[fragKey]*fragBuf, pkt tuicPacket) ([]byte, bool) {
 	return full, true
 }
 
-// writePacketBytes 将 Packet 命令序列化为 []byte，用于 QUIC datagram 发送
+// writePacketBytes serializes a Packet command to []byte for QUIC datagram sending
 func writePacketBytes(pkt tuicPacket) ([]byte, error) {
-	// 估算地址长度
+	// estimate address length
 	var addrLen int
 	switch pkt.addr.typ {
 	case addrIPv4:
@@ -354,94 +366,53 @@ func writePacketBytes(pkt tuicPacket) ([]byte, error) {
 	default:
 		addrLen = 1 + 2
 	}
-	buf := make([]byte, 0, 1+1+2+2+1+1+2+addrLen+len(pkt.data))
-	w := &bytesBuilder{buf: buf}
+	w := bytes.NewBuffer(make([]byte, 0, 1+1+2+2+1+1+2+addrLen+len(pkt.data)))
 	if err := writePacket(w, pkt); err != nil {
 		return nil, err
 	}
-	return w.buf, nil
+	return w.Bytes(), nil
 }
 
-// bytesBuilder 实现 io.Writer，追加到内部 slice
-type bytesBuilder struct{ buf []byte }
-
-func (b *bytesBuilder) Write(p []byte) (int, error) {
-	b.buf = append(b.buf, p...)
-	return len(p), nil
-}
-
-// readPacketFromBytes 从 []byte 解析 Packet 命令（跳过 VER+TYPE 两字节头）
+// readPacketFromBytes parses a Packet command from []byte (skipping the 2-byte VER+TYPE header)
 func readPacketFromBytes(data []byte) (tuicPacket, error) {
 	if len(data) < 2 {
 		return tuicPacket{}, fmt.Errorf("datagram too short")
 	}
-	r := &bytesReader{data: data[2:]} // 跳过 VER+TYPE
+	r := bytes.NewReader(data[2:]) // skip VER+TYPE
 	return readPacket(r)
 }
 
-// bytesReader 实现 io.Reader，从固定 []byte 读取
-type bytesReader struct {
-	data []byte
-	pos  int
-}
-
-func (r *bytesReader) Read(p []byte) (int, error) {
-	if r.pos >= len(r.data) {
-		return 0, io.EOF
-	}
-	n := copy(p, r.data[r.pos:])
-	r.pos += n
-	return n, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 工具
-// ─────────────────────────────────────────────────────────────────────────────
-
-func equalBytes(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := range a {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
-}
-
-func formatBytes(n int64) string {
-	switch {
-	case n >= 1<<30:
-		return fmt.Sprintf("%.2fGB", float64(n)/(1<<30))
-	case n >= 1<<20:
-		return fmt.Sprintf("%.2fMB", float64(n)/(1<<20))
-	case n >= 1<<10:
-		return fmt.Sprintf("%.2fKB", float64(n)/(1<<10))
-	default:
-		return fmt.Sprintf("%dB", n)
+// cleanupFrags removes timed-out fragment buffers from the map.
+// Called both on datagram arrival and during periodic timeout to prevent memory leaks.
+func cleanupFrags(frags map[fragKey]*fragBuf) {
+	now := time.Now()
+	for k, fb := range frags {
+		if now.After(fb.deadline) {
+			delete(frags, k)
+		}
 	}
 }
 
-// receiveStreamReader 适配 *quicgo.ReceiveStream 为 io.Reader
+// receiveStreamReader adapts *quicgo.ReceiveStream to io.Reader
 type receiveStreamReader struct{ s *quicgo.ReceiveStream }
 
 func (r *receiveStreamReader) Read(p []byte) (int, error) { return (*r.s).Read(p) }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Inbound：扮演 TUIC v5 客户端
+// Inbound: acts as TUIC v5 client
 //
-// TUIC v5 客户端职责：
-//   1. 建立 QUIC 连接
-//   2. 通过 unidirectional stream 发送 Authenticate 命令
-//   3. 收到本地 UDP 包时，通过 unidirectional stream 发送 Packet 命令
-//      - assocID：按本地客户端地址分配，同一地址复用同一 assocID
-//      - pktID：每个包单调递增
-//      - fragTotal=1, fragID=0（不分片）
-//      - addr：目标地址（anygo 中固定为 outbound 的 remote）
-//   4. 接受 outbound 发来的 unidirectional stream，解析 Packet 命令，
-//      回写给对应的本地客户端
-//   5. 有活跃 session 时，定期通过 QUIC datagram 发送 Heartbeat
-//   6. session 空闲超时后，通过 unidirectional stream 发送 Dissociate 命令
+// TUIC v5 client responsibilities:
+//   1. establish QUIC connection
+//   2. send Authenticate command via unidirectional stream
+//   3. when receiving a local UDP packet, send a Packet command via unidirectional stream
+//      - assocID: assigned per local client address; same address reuses the same assocID
+//      - pktID: monotonically increasing per packet
+//      - fragTotal=1, fragID=0 (no fragmentation)
+//      - addr: target address (always the outbound remote in anygo)
+//   4. accept unidirectional streams from outbound, parse Packet commands,
+//      and write back to the corresponding local client
+//   5. periodically send Heartbeat via QUIC datagram when there are active sessions
+//   6. session becomes idle, send Dissociate command via unidirectional stream
 // ─────────────────────────────────────────────────────────────────────────────
 
 type inSession struct {
@@ -525,7 +496,7 @@ func (ib *Inbound) Run() error {
 	defer lconn.Close()
 	ib.localConn = lconn
 
-	logger.Info("[tuic-inbound] 监听 %s (TUIC客户端) → %s", ib.cfg.Listen, ib.cfg.Remote)
+	logger.Info("[tuic-inbound] listening %s (TUIC client) → %s", ib.cfg.Listen, ib.cfg.Remote)
 
 	go ib.statsLoop()
 	go ib.cleanupLoop()
@@ -541,7 +512,7 @@ func (ib *Inbound) Run() error {
 			select {
 			case ib.sem <- struct{}{}:
 			default:
-				logger.Warn("[tuic-inbound] 并发包数达上限，丢弃")
+				logger.Warn("[tuic-inbound] packet concurrency limit reached, dropping")
 				continue
 			}
 		}
@@ -565,7 +536,7 @@ func (ib *Inbound) getOrCreateSession(clientAddr *net.UDPAddr) *inSession {
 		lastActive: time.Now(),
 	}
 	ib.sessions[key] = s
-	logger.Debug("[tuic-inbound] 新session assocID=%d client=%s", s.assocID, key)
+	logger.Debug("[tuic-inbound] new session assocID=%d client=%s", s.assocID, key)
 	return s
 }
 
@@ -584,11 +555,11 @@ func (ib *Inbound) handleUDP(clientAddr *net.UDPAddr, data []byte) {
 
 	qconn, err := ib.getConn()
 	if err != nil {
-		logger.Error("[tuic-inbound] 获取QUIC连接失败: %v", err)
+		logger.Error("[tuic-inbound] failed to get QUIC connection: %v", err)
 		return
 	}
 
-	// 构造 Packet 命令
+	// build Packet command
 	pkt := tuicPacket{
 		assocID:   sess.assocID,
 		pktID:     sess.allocPktID(),
@@ -599,7 +570,7 @@ func (ib *Inbound) handleUDP(clientAddr *net.UDPAddr, data []byte) {
 		data:      data,
 	}
 
-	// 通过 QUIC datagram 发送（超过 maxDatagramPayload 自动分片）
+	// send via QUIC datagram (auto-fragment if exceeding maxDatagramPayload)
 	if err := sendDatagramPkt(qconn, pkt); err != nil {
 		select {
 		case <-qconn.Context().Done():
@@ -608,14 +579,14 @@ func (ib *Inbound) handleUDP(clientAddr *net.UDPAddr, data []byte) {
 			ib.connMu.Unlock()
 		default:
 		}
-		logger.Debug("[tuic-inbound] 发送Datagram失败: %v", err)
+		logger.Debug("[tuic-inbound] failed to send datagram: %v", err)
 		return
 	}
 	logger.Debug("[tuic-inbound] → Packet(dgram) assocID=%d pktID=%d size=%d",
 		pkt.assocID, pkt.pktID, pkt.size)
 }
 
-// getConn 获取或重建 QUIC 连接（singleflight）
+// getConn gets or rebuilds the QUIC connection (singleflight)
 func (ib *Inbound) getConn() (*quicgo.Conn, error) {
 	ib.connMu.RLock()
 	conn := ib.conn
@@ -675,8 +646,8 @@ func (ib *Inbound) dial() (*quicgo.Conn, error) {
 	}
 
 	// ── TUIC v5 Authenticate ──────────────────────────────────────────────────
-	// 通过 unidirectional stream 发送：| VER(1) | TYPE(1) | UUID(16) | TOKEN(32) |
-	// TOKEN = sha256(password)（简化认证，anygo 两端都是自己控制的）
+	// send via unidirectional stream: | VER(1) | TYPE(1) | UUID(16) | TOKEN(32) |
+	// TOKEN = sha256(password) (simplified auth; both anygo ends are self-controlled)
 	authCtx, authCancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer authCancel()
 
@@ -686,7 +657,7 @@ func (ib *Inbound) dial() (*quicgo.Conn, error) {
 		return nil, err
 	}
 	h := sha256.Sum256([]byte(ib.cfg.Password))
-	// UUID：用 password hash 前 16 字节（anygo 内部约定，无需真实 UUID）
+	// UUID: first 16 bytes of password hash (anygo internal convention, no real UUID needed)
 	authBuf := make([]byte, 1+1+16+32)
 	authBuf[0] = tuicVersion
 	authBuf[1] = cmdAuthenticate
@@ -703,28 +674,39 @@ func (ib *Inbound) dial() (*quicgo.Conn, error) {
 	ib.conn = qconn
 	ib.connMu.Unlock()
 
-	// 清理旧 session（连接重建后旧 assocID 失效）
+	// clean up old sessions (old assocIDs become invalid after reconnection)
 	ib.sessionsMu.Lock()
 	ib.sessions = make(map[string]*inSession)
 	ib.sessionsMu.Unlock()
 
-	// 启动接收循环：接受 outbound 发来的 Packet 命令
+	// start receive loop: accept Packet commands from outbound
 	go ib.recvLoop(qconn)
-	// 启动心跳
+	// start heartbeat
 	go ib.heartbeatLoop(qconn)
 
-	logger.Info("[tuic-inbound] QUIC连接建立 → %s", ib.cfg.Remote)
+	logger.Info("[tuic-inbound] QUIC connection established → %s", ib.cfg.Remote)
 	return qconn, nil
 }
 
-// recvLoop 接收 outbound 通过 datagram 推回的 Packet 命令
-// 支持分片重组：fragTotal>1 时等所有片到齐后再回写本地
+const fragCleanupInterval = 10 * time.Second
+
+// recvLoop receives Packet commands pushed back from outbound via datagrams
+// supports fragment reassembly: when fragTotal>1, wait for all fragments before writing back to local
 func (ib *Inbound) recvLoop(qconn *quicgo.Conn) {
-	frags := make(map[fragKey]*fragBuf) // 分片重组缓冲（单 goroutine 访问，无需加锁）
+	frags := make(map[fragKey]*fragBuf) // fragment reassembly buffer (single goroutine access, no locking needed)
 	for {
-		dgram, err := qconn.ReceiveDatagram(context.Background())
+		// Use a timeout so we periodically clean up timed-out fragments
+		// even when no new datagrams arrive (prevents memory leak).
+		ctx, cancel := context.WithTimeout(context.Background(), fragCleanupInterval)
+		dgram, err := qconn.ReceiveDatagram(ctx)
+		cancel()
 		if err != nil {
-			return
+			if errors.Is(err, context.DeadlineExceeded) {
+				// Timeout is expected — clean up and continue.
+				cleanupFrags(frags)
+				continue
+			}
+			return // real error, connection closed
 		}
 		if len(dgram) < 2 || dgram[0] != tuicVersion || dgram[1] != cmdPacket {
 			continue
@@ -734,18 +716,13 @@ func (ib *Inbound) recvLoop(qconn *quicgo.Conn) {
 			continue
 		}
 
-		// 清理超时分片
-		now := time.Now()
-		for k, fb := range frags {
-			if now.After(fb.deadline) {
-				delete(frags, k)
-			}
-		}
+		// clean up timed-out fragments (also done during timeout above)
+		cleanupFrags(frags)
 
-		// 分片重组
+		// fragment reassembly
 		data, ok := reassemblePkt(frags, pkt)
 		if !ok {
-			continue // 等待更多分片
+			continue // waiting for more fragments
 		}
 
 		ib.sessionsMu.Lock()
@@ -759,7 +736,7 @@ func (ib *Inbound) recvLoop(qconn *quicgo.Conn) {
 		ib.sessionsMu.Unlock()
 
 		if target == nil {
-			logger.Debug("[tuic-inbound] 收到未知assocID=%d的响应，忽略", pkt.assocID)
+			logger.Debug("[tuic-inbound] received response for unknown assocID=%d, ignoring", pkt.assocID)
 			continue
 		}
 
@@ -771,7 +748,7 @@ func (ib *Inbound) recvLoop(qconn *quicgo.Conn) {
 	}
 }
 
-// heartbeatLoop 有活跃 session 时定期发 TUIC v5 Heartbeat datagram
+// heartbeatLoop periodically sends TUIC v5 Heartbeat datagrams when there are active sessions
 // | VER(1) | TYPE(1) |
 func (ib *Inbound) heartbeatLoop(qconn *quicgo.Conn) {
 	ticker := time.NewTicker(heartbeatEvery)
@@ -795,7 +772,7 @@ func (ib *Inbound) heartbeatLoop(qconn *quicgo.Conn) {
 	}
 }
 
-// cleanupLoop 定期清理空闲 session，并发送 TUIC v5 Dissociate 命令
+// cleanupLoop periodically cleans up idle sessions and sends TUIC v5 Dissociate commands
 func (ib *Inbound) cleanupLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -812,13 +789,13 @@ func (ib *Inbound) cleanupLoop() {
 		ib.sessionsMu.Unlock()
 
 		for _, s := range toRemove {
-			logger.Debug("[tuic-inbound] session超时 assocID=%d，发送Dissociate", s.assocID)
+			logger.Debug("[tuic-inbound] session timed out assocID=%d, sending Dissociate", s.assocID)
 			go ib.sendDissociate(s.assocID)
 		}
 	}
 }
 
-// sendDissociate 通过 unidirectional stream 发送 TUIC v5 Dissociate 命令
+// sendDissociate sends a TUIC v5 Dissociate command via unidirectional stream
 // | VER(1) | TYPE(1) | ASSOC_ID(2) |
 func (ib *Inbound) sendDissociate(assocID uint16) {
 	qconn, err := ib.getConn()
@@ -843,27 +820,27 @@ func (ib *Inbound) statsLoop() {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		logger.Info("[tuic-inbound:%s] 统计 | 累计包: %d  收: %s  发: %s",
+		logger.Info("[tuic-inbound:%s] stats | total packets: %d  rx: %s  tx: %s",
 			ib.cfg.Listen,
 			ib.stats.totalPkts.Load(),
-			formatBytes(ib.stats.bytesIn.Load()),
-			formatBytes(ib.stats.bytesOut.Load()),
+			util.FormatBytes(ib.stats.bytesIn.Load()),
+			util.FormatBytes(ib.stats.bytesOut.Load()),
 		)
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Outbound：扮演 TUIC v5 服务端
+// Outbound: acts as TUIC v5 server
 //
-// TUIC v5 服务端职责：
-//   1. 监听 QUIC 连接
-//   2. 接受 unidirectional stream，解析命令：
-//      - Authenticate：验证 TOKEN，标记连接为已认证
-//      - Packet：按 assocID 查找或创建 UDP socket，发给目标地址
-//      - Dissociate：关闭对应 UDP socket
-//   3. 收到目标地址的 UDP 响应时，通过 unidirectional stream 发回 Packet 命令
-//      （源地址填实际收到响应的地址）
-//   4. 接受 QUIC datagram，忽略 Heartbeat（QUIC 层自动处理保活）
+// TUIC v5 server responsibilities:
+//   1. listen for QUIC connections
+//   2. accept unidirectional streams, parse commands:
+//      - Authenticate: verify TOKEN, mark connection as authenticated
+//      - Packet: lookup or create UDP socket by assocID, forward to target address
+//      - Dissociate: close the corresponding UDP socket
+//   3. when receiving a UDP response from target, send a Packet command back via unidirectional stream
+//      (source address is the actual address the response came from)
+//   4. accept QUIC datagrams; ignore Heartbeat (keepalive is handled at the QUIC layer)
 // ─────────────────────────────────────────────────────────────────────────────
 
 type outSession struct {
@@ -920,13 +897,13 @@ func NewOutbound(cfg *config.MergedConfig) *Outbound {
 func (ob *Outbound) Run() error {
 	targetAddr, err := net.ResolveUDPAddr("udp", ob.cfg.Remote)
 	if err != nil {
-		return fmt.Errorf("解析目标地址失败: %w", err)
+		return fmt.Errorf("failed to resolve target address: %w", err)
 	}
 	ob.targetAddr = targetAddr
 
 	cert, err := tls.LoadX509KeyPair(ob.cfg.Cert, ob.cfg.Key)
 	if err != nil {
-		return fmt.Errorf("加载证书失败: %w", err)
+		return fmt.Errorf("failed to load certificate: %w", err)
 	}
 
 	tlsCfg := &tls.Config{
@@ -949,7 +926,7 @@ func (ob *Outbound) Run() error {
 	}
 	defer listener.Close()
 
-	logger.Info("[tuic-outbound] 监听 %s (TUIC服务端) → %s", ob.cfg.Listen, ob.cfg.Remote)
+	logger.Info("[tuic-outbound] listening %s (TUIC server) → %s", ob.cfg.Listen, ob.cfg.Remote)
 	go ob.statsLoop()
 
 	for {
@@ -962,7 +939,7 @@ func (ob *Outbound) Run() error {
 			select {
 			case ob.sem <- struct{}{}:
 			default:
-				logger.Warn("[tuic-outbound] 连接数达上限，拒绝")
+				logger.Warn("[tuic-outbound] connection limit reached, rejecting")
 				conn.CloseWithError(0, "too many connections")
 				continue
 			}
@@ -973,14 +950,14 @@ func (ob *Outbound) Run() error {
 	}
 }
 
-// connState 每条 QUIC 连接的状态
+// connState holds per-QUIC-connection state
 type connState struct {
 	ob         *Outbound
 	qconn      *quicgo.Conn
 	authed     atomic.Bool
 	sessions   map[uint16]*outSession
 	sessionsMu sync.Mutex
-	// 待处理命令缓冲（认证前到达的命令先缓冲）
+	// pending command buffer (commands arriving before auth are buffered)
 	pendingMu  sync.Mutex
 	pending    []func()
 }
@@ -1000,13 +977,13 @@ func (ob *Outbound) handleConn(qconn *quicgo.Conn) {
 		sessions: make(map[uint16]*outSession),
 	}
 
-	// 接受 datagram（Heartbeat）
+	// accept datagrams (Heartbeat)
 	go cs.recvDatagrams()
 
-	// session 空闲清理
+	// session idle cleanup
 	go cs.sessionCleanup()
 
-	// 循环接受 unidirectional stream
+	// loop accepting unidirectional streams
 	for {
 		stream, err := qconn.AcceptUniStream(context.Background())
 		if err != nil {
@@ -1015,7 +992,7 @@ func (ob *Outbound) handleConn(qconn *quicgo.Conn) {
 		go cs.handleStream(stream)
 	}
 
-	// 关闭所有 session
+	// close all sessions
 	cs.sessionsMu.Lock()
 	for _, s := range cs.sessions {
 		s.close()
@@ -1023,13 +1000,21 @@ func (ob *Outbound) handleConn(qconn *quicgo.Conn) {
 	cs.sessionsMu.Unlock()
 }
 
-// recvDatagrams 处理所有入站 datagram：Heartbeat 和 Packet 命令
-// 支持分片重组，直接在循环里处理减少 goroutine 开销
+// recvDatagrams handles all inbound datagrams: Heartbeat and Packet commands
+// supports fragment reassembly; processes inline in the loop to reduce goroutine overhead
 func (cs *connState) recvDatagrams() {
-	frags := make(map[fragKey]*fragBuf) // 分片重组缓冲（单 goroutine 访问，无需加锁）
+	frags := make(map[fragKey]*fragBuf) // fragment reassembly buffer (single goroutine access, no locking needed)
 	for {
-		dgram, err := cs.qconn.ReceiveDatagram(context.Background())
+		// Use a timeout so we periodically clean up timed-out fragments
+		// even when no new datagrams arrive (prevents memory leak).
+		ctx, cancel := context.WithTimeout(context.Background(), fragCleanupInterval)
+		dgram, err := cs.qconn.ReceiveDatagram(ctx)
+		cancel()
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				cleanupFrags(frags)
+				continue
+			}
 			return
 		}
 		if len(dgram) < 2 || dgram[0] != tuicVersion {
@@ -1037,10 +1022,10 @@ func (cs *connState) recvDatagrams() {
 		}
 		switch dgram[1] {
 		case cmdHeartbeat:
-			logger.Debug("[tuic-outbound] 收到Heartbeat")
+			logger.Debug("[tuic-outbound] received Heartbeat")
 		case cmdPacket:
 			if !cs.authed.Load() {
-				logger.Warn("[tuic-outbound] 未认证连接发送Packet(dgram)，忽略")
+				logger.Warn("[tuic-outbound] unauthenticated connection sent Packet(dgram), ignoring")
 				continue
 			}
 			pkt, err := readPacketFromBytes(dgram)
@@ -1048,18 +1033,13 @@ func (cs *connState) recvDatagrams() {
 				continue
 			}
 
-			// 清理超时分片
-			now := time.Now()
-			for k, fb := range frags {
-				if now.After(fb.deadline) {
-					delete(frags, k)
-				}
-			}
+			// clean up timed-out fragments (also done during timeout above)
+			cleanupFrags(frags)
 
-			// 分片重组
+			// fragment reassembly
 			data, ok := reassemblePkt(frags, pkt)
 			if !ok {
-				continue // 等待更多分片
+				continue // waiting for more fragments
 			}
 
 			cs.ob.stats.bytesIn.Add(int64(len(data)))
@@ -1072,7 +1052,7 @@ func (cs *connState) recvDatagrams() {
 				udpConn, err := net.DialUDP("udp", nil, cs.ob.targetAddr)
 				if err != nil {
 					cs.sessionsMu.Unlock()
-					logger.Error("[tuic-outbound] 创建UDP连接失败 assocID=%d: %v", pkt.assocID, err)
+					logger.Error("[tuic-outbound] failed to create UDP socket assocID=%d: %v", pkt.assocID, err)
 					continue
 				}
 				sess = &outSession{
@@ -1081,14 +1061,14 @@ func (cs *connState) recvDatagrams() {
 					lastActive: time.Now(),
 				}
 				cs.sessions[pkt.assocID] = sess
-				logger.Debug("[tuic-outbound] 新session assocID=%d → %s", pkt.assocID, cs.ob.targetAddr)
+				logger.Debug("[tuic-outbound] new session assocID=%d → %s", pkt.assocID, cs.ob.targetAddr)
 				go cs.recvFromTarget(pkt.assocID, sess)
 			}
 			cs.sessionsMu.Unlock()
 
 			sess.touch()
 			if _, err := sess.udpConn.Write(data); err != nil {
-				logger.Debug("[tuic-outbound] UDP发送失败 assocID=%d: %v", pkt.assocID, err)
+				logger.Debug("[tuic-outbound] UDP send failed assocID=%d: %v", pkt.assocID, err)
 			}
 		}
 	}
@@ -1105,7 +1085,7 @@ func (cs *connState) sessionCleanup() {
 			cs.sessionsMu.Lock()
 			for id, s := range cs.sessions {
 				if s.idle() > sessionIdle {
-					logger.Debug("[tuic-outbound] session超时 assocID=%d", id)
+					logger.Debug("[tuic-outbound] session timed out assocID=%d", id)
 					s.close()
 					delete(cs.sessions, id)
 				}
@@ -1120,13 +1100,13 @@ func (cs *connState) handleStream(stream *quicgo.ReceiveStream) {
 	defer (*stream).CancelRead(0)
 	(*stream).SetReadDeadline(time.Now().Add(idleTimeout))
 
-	// 读 VER + TYPE
+	// read VER + TYPE
 	hdr := make([]byte, 2)
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return
 	}
 	if hdr[0] != tuicVersion {
-		logger.Warn("[tuic-outbound] 未知TUIC版本: 0x%02x", hdr[0])
+		logger.Warn("[tuic-outbound] unknown TUIC version: 0x%02x", hdr[0])
 		return
 	}
 
@@ -1134,8 +1114,8 @@ func (cs *connState) handleStream(stream *quicgo.ReceiveStream) {
 	case cmdAuthenticate:
 		cs.handleAuth(r)
 	case cmdPacket:
-		// Packet 命令已改为 datagram 传输，stream 里收到的忽略
-		logger.Debug("[tuic-outbound] 收到stream Packet，已改用datagram，忽略")
+		// Packet commands now use datagram transport, ignoring stream-based Packet
+		logger.Debug("[tuic-outbound] received stream-based Packet, now using datagrams, ignoring")
 	case cmdDissociate:
 		if !cs.authed.Load() {
 			return
@@ -1144,27 +1124,27 @@ func (cs *connState) handleStream(stream *quicgo.ReceiveStream) {
 	}
 }
 
-// handleAuth 处理 TUIC v5 Authenticate 命令
-// | UUID(16) | TOKEN(32) |（VER+TYPE 已读）
+// handleAuth processes the TUIC v5 Authenticate command
+// | UUID(16) | TOKEN(32) |(VER+TYPE already read)
 func (cs *connState) handleAuth(r io.Reader) {
 	buf := make([]byte, 16+32)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		cs.qconn.CloseWithError(1, "auth read failed")
 		return
 	}
-	token := buf[16:] // TOKEN 在 UUID 之后
+	token := buf[16:] // TOKEN follows UUID
 	expected := sha256.Sum256([]byte(cs.ob.cfg.Password))
-	if !equalBytes(token, expected[:]) {
-		logger.Warn("[tuic-outbound] 认证失败 from %s", cs.qconn.RemoteAddr())
+	if !util.EqualBytes(token, expected[:]) {
+		logger.Warn("[tuic-outbound] auth failed from %s", cs.qconn.RemoteAddr())
 		cs.qconn.CloseWithError(1, "auth failed")
 		return
 	}
 	cs.authed.Store(true)
-	logger.Debug("[tuic-outbound] 认证成功: %s", cs.qconn.RemoteAddr())
+	logger.Debug("[tuic-outbound] auth succeeded: %s", cs.qconn.RemoteAddr())
 }
 
-// handlePacket 处理 TUIC v5 Packet 命令
-// （VER+TYPE 已读）
+// handlePacket processes the TUIC v5 Packet command
+// (VER+TYPE already read)
 func (cs *connState) handlePacket(r io.Reader) {
 	pkt, err := readPacket(r)
 	if err != nil {
@@ -1175,14 +1155,14 @@ func (cs *connState) handlePacket(r io.Reader) {
 	logger.Debug("[tuic-outbound] ← Packet assocID=%d pktID=%d frag=%d/%d size=%d",
 		pkt.assocID, pkt.pktID, pkt.fragID+1, pkt.fragTotal, pkt.size)
 
-	// 获取或创建该 assocID 对应的 UDP socket
+	// get or create the UDP socket for this assocID
 	cs.sessionsMu.Lock()
 	sess, ok := cs.sessions[pkt.assocID]
 	if !ok {
 		udpConn, err := net.DialUDP("udp", nil, cs.ob.targetAddr)
 		if err != nil {
 			cs.sessionsMu.Unlock()
-			logger.Error("[tuic-outbound] 创建UDP连接失败 assocID=%d: %v", pkt.assocID, err)
+			logger.Error("[tuic-outbound] failed to create UDP socket assocID=%d: %v", pkt.assocID, err)
 			return
 		}
 		sess = &outSession{
@@ -1191,22 +1171,22 @@ func (cs *connState) handlePacket(r io.Reader) {
 			lastActive: time.Now(),
 		}
 		cs.sessions[pkt.assocID] = sess
-		logger.Debug("[tuic-outbound] 新session assocID=%d → %s", pkt.assocID, cs.ob.targetAddr)
-		// 启动接收循环：目标 → 客户端
+		logger.Debug("[tuic-outbound] new session assocID=%d → %s", pkt.assocID, cs.ob.targetAddr)
+		// start receive loop: target → client
 		go cs.recvFromTarget(pkt.assocID, sess)
 	}
 	cs.sessionsMu.Unlock()
 
 	sess.touch()
 
-	// 发送给目标 UDP 节点
+	// send to target UDP node
 	if _, err := sess.udpConn.Write(pkt.data); err != nil {
-		logger.Debug("[tuic-outbound] UDP发送失败 assocID=%d: %v", pkt.assocID, err)
+		logger.Debug("[tuic-outbound] UDP send failed assocID=%d: %v", pkt.assocID, err)
 	}
 }
 
-// handleDissociate 处理 TUIC v5 Dissociate 命令
-// | ASSOC_ID(2) |（VER+TYPE 已读）
+// handleDissociate processes the TUIC v5 Dissociate command
+// | ASSOC_ID(2) |(VER+TYPE already read)
 func (cs *connState) handleDissociate(r io.Reader) {
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -1222,10 +1202,11 @@ func (cs *connState) handleDissociate(r io.Reader) {
 	logger.Debug("[tuic-outbound] Dissociate assocID=%d", assocID)
 }
 
-// recvFromTarget 持续接收目标 UDP 节点的响应，通过 unidirectional stream 发回客户端
-// 响应 Packet 命令：ADDR 填实际收到响应的源地址（TUIC v5 规范要求）
+// recvFromTarget continuously receives responses from the target UDP node and sends them back to the client via unidirectional stream
+// response Packet command: ADDR is filled with the actual source address (as required by TUIC v5 spec)
 func (cs *connState) recvFromTarget(assocID uint16, sess *outSession) {
-	buf := make([]byte, udpBufSize)
+	buf := udpBufPool.Get().([]byte)
+	defer udpBufPool.Put(buf) //nolint:staticcheck // returned to pool on goroutine exit
 	var pktID uint16
 	for {
 		select {
@@ -1241,10 +1222,10 @@ func (cs *connState) recvFromTarget(assocID uint16, sess *outSession) {
 
 		sess.touch()
 		cs.ob.stats.bytesOut.Add(int64(n))
-		// 直接用 buf 切片，writePacketBytes 内部会 copy 数据
+		// use buf slice directly; writePacketBytes copies data internally
 		data := buf[:n]
 
-		// 构造响应 Packet 命令，ADDR 填真实源地址
+		// build response Packet command; ADDR uses the real source address
 		var addr tuicAddr
 		if srcAddr != nil {
 			addr = udpAddrToTUIC(srcAddr)
@@ -1263,9 +1244,9 @@ func (cs *connState) recvFromTarget(assocID uint16, sess *outSession) {
 		}
 		pktID++
 
-		// 通过 datagram 推回 inbound（超过 maxDatagramPayload 自动分片）
+		// push back to inbound via datagram (auto-fragment if exceeding maxDatagramPayload)
 		if err := sendDatagramPkt(cs.qconn, pkt); err != nil {
-			logger.Debug("[tuic-outbound] 发送Datagram失败 assocID=%d: %v", assocID, err)
+			logger.Debug("[tuic-outbound] failed to send datagram assocID=%d: %v", assocID, err)
 			return
 		}
 
@@ -1278,12 +1259,12 @@ func (ob *Outbound) statsLoop() {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		logger.Info("[tuic-outbound:%s] 统计 | 累计连接: %d  活跃: %d  收: %s  发: %s",
+		logger.Info("[tuic-outbound:%s] stats | total: %d  active: %d  rx: %s  tx: %s",
 			ob.cfg.Listen,
 			ob.stats.totalConns.Load(),
 			ob.stats.activeConns.Load(),
-			formatBytes(ob.stats.bytesIn.Load()),
-			formatBytes(ob.stats.bytesOut.Load()),
+			util.FormatBytes(ob.stats.bytesIn.Load()),
+			util.FormatBytes(ob.stats.bytesOut.Load()),
 		)
 	}
 }

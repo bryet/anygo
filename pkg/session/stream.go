@@ -12,14 +12,23 @@ type streamState int
 const (
 	streamOpen   streamState = iota
 	streamClosed streamState = iota
+
+	// maxReadBufSize is the maximum read buffer size per stream.
+	// When exceeded, the stream is closed to signal backpressure to the sender.
+	// 4 MB is large enough for most TCP workloads while preventing OOM.
+	defaultMaxReadBufSize = 4 * 1024 * 1024
 )
 
-// Stream 复用Session上的一条虚拟连接，实现net.Conn接口
+// MaxReadBufSize is the per-stream read buffer limit. Set to 0 for unlimited.
+// Can be adjusted at startup based on expected workload.
+var MaxReadBufSize = defaultMaxReadBufSize
+
+// Stream: virtual connection over a multiplexed Session, implements net.Conn
 //
-// 锁顺序规范（避免死锁）：
+// lock ordering rules (to avoid deadlocks):
 //
-//	stateMu 和 readMu 永远不同时持有。
-//	Read 检查 state 时：临时释放 readMu → 加 stateMu → 释放 stateMu → 重新加 readMu
+//	stateMu and readMu are never held at the same time.
+//	When Read checks state: release readMu → acquire stateMu → release stateMu → re-acquire readMu
 type Stream struct {
 	id      uint32
 	session *Session
@@ -56,14 +65,23 @@ func (s *Stream) ID() uint32 {
 
 func (s *Stream) pushData(data []byte) {
 	s.readMu.Lock()
+
+	if MaxReadBufSize > 0 && len(s.readBuf)+len(data) > MaxReadBufSize {
+		// Buffer overflow — close the stream to prevent OOM.
+		// Release readMu before closeByRemote to avoid lock ordering issues.
+		s.readMu.Unlock()
+		s.closeByRemote()
+		return
+	}
+
 	defer s.readMu.Unlock()
 	s.readBuf = append(s.readBuf, data...)
 	s.readCond.Signal()
 }
 
-// Read 实现net.Conn
-// 修复：检查 state 时临时释放 readMu，避免与 Close/closeByRemote 的锁顺序冲突
-// timer 在循环外创建一次并复用，避免重复分配
+// Read implements net.Conn
+// fix: temporarily release readMu when checking state, to avoid lock ordering conflict with Close/closeByRemote
+// timer created once outside the loop and reused to avoid repeated allocation
 func (s *Stream) Read(buf []byte) (int, error) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
@@ -76,14 +94,14 @@ func (s *Stream) Read(buf []byte) (int, error) {
 	}()
 
 	for {
-		// 有数据直接返回
+		// if data is available, return immediately
 		if len(s.readBuf) > 0 {
 			n := copy(buf, s.readBuf)
 			s.readBuf = s.readBuf[n:]
 			return n, nil
 		}
 
-		// 修复：检查 state 时先释放 readMu，单独加 stateMu，不嵌套持有两个锁
+		// fix: release readMu before checking state; acquire stateMu separately without holding both locks
 		s.readMu.Unlock()
 		s.stateMu.Lock()
 		closed := s.state == streamClosed
@@ -91,7 +109,7 @@ func (s *Stream) Read(buf []byte) (int, error) {
 		s.readMu.Lock()
 
 		if closed {
-			// 关闭后再检查一次缓冲，确保已推送的数据不丢失
+			// after close, check buffer again to ensure pushed data is not lost
 			if len(s.readBuf) > 0 {
 				n := copy(buf, s.readBuf)
 				s.readBuf = s.readBuf[n:]
@@ -100,7 +118,7 @@ func (s *Stream) Read(buf []byte) (int, error) {
 			return 0, io.EOF
 		}
 
-		// 检查 deadline
+		// check deadline
 		s.deadlineMu.RLock()
 		deadline := s.readDeadline
 		s.deadlineMu.RUnlock()
@@ -110,7 +128,7 @@ func (s *Stream) Read(buf []byte) (int, error) {
 			if remaining <= 0 {
 				return 0, &timeoutError{}
 			}
-			// 复用 timer：第一次创建，后续 Reset
+			// reuse timer: create on first use, Reset on subsequent uses
 			if timer == nil {
 				timer = time.AfterFunc(remaining, func() {
 					s.readCond.Signal()
@@ -132,7 +150,7 @@ func (s *Stream) Read(buf []byte) (int, error) {
 	}
 }
 
-// Write 实现net.Conn，通过Session发送cmdPSH
+// Write implements net.Conn; sends cmdPSH via Session
 func (s *Stream) Write(data []byte) (int, error) {
 	s.stateMu.Lock()
 	if s.state == streamClosed {
@@ -147,8 +165,8 @@ func (s *Stream) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-// Close 关闭Stream，发送cmdFIN
-// 修复：Signal 不需要持有 readMu（Cond.Signal 是并发安全的）
+// Close close a Stream, sends cmdFIN
+// fix: Signal does not require holding readMu (Cond.Signal is concurrency-safe)
 func (s *Stream) Close() error {
 	s.once.Do(func() {
 		s.stateMu.Lock()
@@ -162,7 +180,7 @@ func (s *Stream) Close() error {
 	return nil
 }
 
-// closeByRemote 由Session在收到对端cmdFIN时调用
+// closeByRemote is called by Session when receiving cmdFIN from the peer
 func (s *Stream) closeByRemote() {
 	s.stateMu.Lock()
 	s.state = streamClosed

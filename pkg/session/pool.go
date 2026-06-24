@@ -10,8 +10,8 @@ import (
 
 const maxGetStreamRetries = 3
 
-// Pool 客户端空闲Session池
-// 策略：优先复用最新（Seq最大）的Session，优先清理最老的Session
+// Pool: client idle session pool
+// strategy: prefer the newest (highest Seq) Session; evict oldest first
 type Pool struct {
 	mu       sync.Mutex
 	sessions []*ClientSession
@@ -20,6 +20,7 @@ type Pool struct {
 	checkInterval  time.Duration
 	idleTimeout    time.Duration
 	minIdleSession int
+	maxIdleSession int // hard cap; 0 = no limit
 
 	dial func() (*ClientSession, error)
 
@@ -31,19 +32,21 @@ func NewPool(
 	checkInterval time.Duration,
 	idleTimeout time.Duration,
 	minIdleSession int,
+	maxIdleSession int,
 ) *Pool {
 	p := &Pool{
 		dial:           dial,
 		checkInterval:  checkInterval,
 		idleTimeout:    idleTimeout,
 		minIdleSession: minIdleSession,
+		maxIdleSession: maxIdleSession,
 		done:           make(chan struct{}),
 	}
 	go p.cleanupLoop()
 	return p
 }
 
-// GetStream 获取一个可用的Stream，循环重试避免栈溢出
+// GetStream gets an available Stream, retries in a loop to avoid stack overflow
 func (p *Pool) GetStream() (*Stream, *ClientSession, error) {
 	for attempt := 0; attempt < maxGetStreamRetries; attempt++ {
 		stream, cs, err := p.tryGetStream()
@@ -52,14 +55,14 @@ func (p *Pool) GetStream() (*Stream, *ClientSession, error) {
 		}
 		log.Printf("[pool] GetStream attempt %d failed: %v", attempt+1, err)
 	}
-	return nil, nil, fmt.Errorf("获取stream失败，已重试%d次", maxGetStreamRetries)
+	return nil, nil, fmt.Errorf("get stream failed, after %d retries", maxGetStreamRetries)
 }
 
-// tryGetStream 单次尝试获取Stream
+// tryGetStream makes a single attempt to get a Stream
 func (p *Pool) tryGetStream() (*Stream, *ClientSession, error) {
 	p.mu.Lock()
 
-	// 修复：遍历时顺便清除已关闭的 Session，避免列表无限增长
+	// fix: remove closed Sessions during traversal to prevent unbounded growth
 	var active []*ClientSession
 	for _, cs := range p.sessions {
 		if !cs.IsClosed() {
@@ -68,7 +71,7 @@ func (p *Pool) tryGetStream() (*Stream, *ClientSession, error) {
 	}
 	p.sessions = active
 
-	// 找 Seq 最大的空闲 Session
+	// find the idle Session with the highest Seq
 	var best *ClientSession
 	bestIdx := -1
 	for i, cs := range p.sessions {
@@ -94,7 +97,7 @@ func (p *Pool) tryGetStream() (*Stream, *ClientSession, error) {
 	}
 	p.mu.Unlock()
 
-	// 没有空闲 Session，新建
+	// no idle Sessions, creating a new one
 	cs, err := p.newSession()
 	if err != nil {
 		return nil, nil, err
@@ -108,18 +111,45 @@ func (p *Pool) tryGetStream() (*Stream, *ClientSession, error) {
 	return stream, cs, nil
 }
 
-// ReturnSession Stream使用完毕后，将Session放回空闲池
+// ReturnSession returns a Session to the idle pool after Stream use.
+// If adding this session would exceed maxIdleSession, the oldest idle session is closed.
 func (p *Pool) ReturnSession(cs *ClientSession) {
 	if cs.IsClosed() {
 		return
 	}
 	cs.SetIdle()
 	p.mu.Lock()
+
+	// Enforce hard cap: if over the limit, evict the oldest (lowest seq).
+	if p.maxIdleSession > 0 && len(p.sessions) >= p.maxIdleSession {
+		p.evictOldestLocked()
+	}
+
 	p.sessions = append(p.sessions, cs)
 	p.mu.Unlock()
 }
 
-// newSession 新建一个ClientSession
+// evictOldestLocked closes the idle session with the lowest seq.
+// Must be called while holding p.mu.
+func (p *Pool) evictOldestLocked() {
+	if len(p.sessions) == 0 {
+		return
+	}
+	oldestIdx := 0
+	oldestSeq := p.sessions[0].seq
+	for i, cs := range p.sessions {
+		if cs.seq < oldestSeq {
+			oldestSeq = cs.seq
+			oldestIdx = i
+		}
+	}
+	victim := p.sessions[oldestIdx]
+	p.sessions = append(p.sessions[:oldestIdx], p.sessions[oldestIdx+1:]...)
+	log.Printf("[pool] evicting oldest idle session seq=%d (maxIdleSession=%d)", victim.seq, p.maxIdleSession)
+	victim.close(nil)
+}
+
+// newSession creates a new ClientSession
 func (p *Pool) newSession() (*ClientSession, error) {
 	cs, err := p.dial()
 	if err != nil {
@@ -135,7 +165,7 @@ func (p *Pool) newSession() (*ClientSession, error) {
 	return cs, nil
 }
 
-// cleanupLoop 定期清理超时的空闲Session
+// cleanupLoop periodically cleans up timed-out idle Sessions
 func (p *Pool) cleanupLoop() {
 	ticker := time.NewTicker(p.checkInterval)
 	defer ticker.Stop()
@@ -163,18 +193,28 @@ func (p *Pool) cleanup() {
 		}
 	}
 
-	// 按 Seq 从大到小排序（Seq大=最新）
+	// sort by Seq descending (higher Seq = newer)
 	sort.Slice(alive, func(i, j int) bool {
 		return alive[i].seq > alive[j].seq
 	})
 
+	// Enforce max idle cap first (overrides minIdleSession).
+	maxKeep := p.maxIdleSession
+	if maxKeep <= 0 {
+		maxKeep = len(alive) // no cap
+	}
+	if maxKeep < p.minIdleSession {
+		maxKeep = p.minIdleSession // never keep fewer than min
+	}
+
 	var kept []*ClientSession
 	for i, cs := range alive {
+		// Always keep at least minIdleSession, plus enforce the max cap.
 		if i < p.minIdleSession {
 			kept = append(kept, cs)
 			continue
 		}
-		if now.Sub(cs.IdleSince()) > p.idleTimeout {
+		if len(kept) >= maxKeep || now.Sub(cs.IdleSince()) > p.idleTimeout {
 			log.Printf("[pool] closing idle session seq=%d (idle %v)", cs.seq, now.Sub(cs.IdleSince()))
 			cs.close(nil)
 		} else {
@@ -185,7 +225,7 @@ func (p *Pool) cleanup() {
 	p.sessions = kept
 }
 
-// Close 关闭池
+// Close shuts down the pool
 func (p *Pool) Close() {
 	close(p.done)
 	p.mu.Lock()

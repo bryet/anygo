@@ -16,8 +16,8 @@ import (
 const version = "0.1.0"
 
 func main() {
-	configPath := flag.String("config", "config.yaml", "配置文件路径")
-	showVersion := flag.Bool("version", false, "显示版本")
+	configPath := flag.String("config", "config.yaml", "config file path")
+	showVersion := flag.Bool("version", false, "show version")
 	flag.Parse()
 
 	if *showVersion {
@@ -27,15 +27,15 @@ func main() {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		// 此时 logger 还未初始化，直接用 fmt
-		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
+		// logger not yet initialized; use fmt directly
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 初始化日志（使用配置文件里的级别）
+	// initialize logger with level from config
 	logger.Init(cfg.LogLevel)
 
-	// 统计 inbound/outbound 数量
+	// count inbound/outbound tunnels
 	inboundCount, outboundCount := 0, 0
 	for i := range cfg.Tunnels {
 		switch cfg.Tunnels[i].Mode() {
@@ -45,7 +45,7 @@ func main() {
 			outboundCount++
 		}
 	}
-	logger.Info("anygo v%s 启动 | inbound: %d  outbound: %d", version, inboundCount, outboundCount)
+	logger.Info("anygo v%s starting | inbound: %d  outbound: %d", version, inboundCount, outboundCount)
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(cfg.Tunnels)*2)
@@ -90,7 +90,7 @@ func main() {
 		}
 	}
 
-	// wg 结束后关闭 errCh，避免 drain goroutine 泄漏
+	// close errCh after wg completes to avoid drain goroutine leak
 	go func() {
 		wg.Wait()
 		close(errCh)
@@ -100,6 +100,6 @@ func main() {
 		logger.Error("tunnel error: %v", err)
 	}
 
-	logger.Info("所有 tunnel 已停止，程序退出")
+	logger.Info("all tunnels stopped, exiting")
 	os.Exit(1)
 }

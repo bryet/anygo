@@ -10,7 +10,7 @@ import (
 	"sync"
 )
 
-// DefaultSchemeText 默认PaddingScheme文本（官方默认值）
+// DefaultSchemeText: default PaddingScheme text (official default)
 const DefaultSchemeText = `stop=8
 0=30-30
 1=100-400
@@ -21,32 +21,32 @@ const DefaultSchemeText = `stop=8
 6=500-1000
 7=500-1000`
 
-// Segment 一个分段策略单元
+// Segment: a single padding segment strategy
 type Segment struct {
 	Min   int
 	Max   int
-	Check bool // true表示这是'c'检查符号
+	Check bool // true means this is the 'c' checkpoint
 }
 
-// Scheme 完整的PaddingScheme
+// Scheme: complete PaddingScheme
 type Scheme struct {
-	Stop  int               // 只处理第0~Stop-1个包
-	Rules map[int][]Segment // 每个包的分段策略列表
-	raw   string            // 原始文本
+	Stop  int               // only process packets 0 to Stop-1
+	Rules map[int][]Segment // per-packet segment strategy list
+	raw   string            // original text
 }
 
-// MD5 返回scheme原始文本的md5（小写hex），用于cmdSettings上报
+// MD5 returns the md5 (lowercase hex) of the raw scheme text, for cmdSettings
 func (s *Scheme) MD5() string {
 	h := md5.Sum([]byte(s.raw))
 	return fmt.Sprintf("%x", h)
 }
 
-// Raw 返回原始scheme文本，用于cmdUpdatePaddingScheme下发
+// Raw returns the raw scheme text, for cmdUpdatePaddingScheme
 func (s *Scheme) Raw() string {
 	return s.raw
 }
 
-// Parse 解析PaddingScheme文本
+// Parse parses PaddingScheme text
 func Parse(text string) (*Scheme, error) {
 	scheme := &Scheme{
 		Stop:  8,
@@ -91,19 +91,19 @@ func Parse(text string) (*Scheme, error) {
 	return scheme, nil
 }
 
-// 修复：用 sync.Once 缓存默认 scheme，避免每次调用 Default() 重新解析
+// fix: use sync.Once to cache default scheme, avoid re-parsing on every Default() call
 var (
 	defaultSchemeOnce sync.Once
 	defaultScheme     *Scheme
 )
 
-// Default 返回解析好的默认PaddingScheme（全局单例，只解析一次）
+// Default returns the parsed default PaddingScheme (global singleton, parsed once)
 func Default() *Scheme {
 	defaultSchemeOnce.Do(func() {
 		var err error
 		defaultScheme, err = Parse(DefaultSchemeText)
 		if err != nil {
-			// DefaultSchemeText 是硬编码的合法值，不应出错
+			// DefaultSchemeText is a hardcoded valid value; this should never fail
 			panic(fmt.Sprintf("parse default padding scheme failed: %v", err))
 		}
 	})
@@ -141,7 +141,7 @@ func parseSegments(s string) ([]Segment, error) {
 	return segs, nil
 }
 
-// RandInRange 返回[min, max]范围内的随机整数
+// RandInRange returns a random integer in [min, max]
 func RandInRange(min, max int) int {
 	if min >= max {
 		return min
@@ -150,14 +150,14 @@ func RandInRange(min, max int) int {
 	return min + int(n.Int64())
 }
 
-// RandBytes 生成n字节随机数据
+// RandBytes generates n bytes of random data
 func RandBytes(n int) []byte {
 	b := make([]byte, n)
 	rand.Read(b)
 	return b
 }
 
-// Padding0Size 根据scheme第0条规则返回padding0大小
+// Padding0Size returns the padding0 size based on rule 0 of the scheme
 func (s *Scheme) Padding0Size() int {
 	segs, ok := s.Rules[0]
 	if !ok || len(segs) == 0 {

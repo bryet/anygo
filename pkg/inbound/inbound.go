@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -15,21 +14,22 @@ import (
 	"anygo/pkg/logger"
 	"anygo/pkg/padding"
 	"anygo/pkg/session"
+	"anygo/pkg/util"
 
 	utls "github.com/refraction-networking/utls"
 )
 
 const dialTimeout = 10 * time.Second
 
-// stats 流量统计
+// stats: traffic statistics
 type stats struct {
-	totalConns  atomic.Int64 // 累计连接数
-	activeConns atomic.Int64 // 当前活跃连接数
-	bytesIn     atomic.Int64 // 从客户端收到的字节数
-	bytesOut    atomic.Int64 // 发送给客户端的字节数
+	totalConns  atomic.Int64 // total connections
+	activeConns atomic.Int64 // active connections
+	bytesIn     atomic.Int64 // bytes received from client
+	bytesOut    atomic.Int64 // bytes sent to client
 }
 
-// Inbound 境内入口节点，扮演AnyTLS客户端角色
+// Inbound entry node, acts as AnyTLS client
 type Inbound struct {
 	cfg  *config.MergedConfig
 	pool *session.Pool
@@ -39,7 +39,7 @@ type Inbound struct {
 
 	stats stats
 
-	// semaphore 限制最大并发连接数（MaxConns=0 表示不限制）
+	// semaphore limits max concurrent connections (MaxConns=0 means unlimited)
 	sem chan struct{}
 }
 
@@ -69,6 +69,7 @@ func (ib *Inbound) Run() error {
 		checkInterval,
 		idleTimeout,
 		ib.cfg.MinIdleSession,
+		ib.cfg.MaxIdleSession,
 	)
 
 	listener, err := net.Listen("tcp", ib.cfg.Listen)
@@ -80,10 +81,10 @@ func (ib *Inbound) Run() error {
 	if ib.cfg.MaxConns > 0 {
 		maxConnsStr = fmt.Sprintf("%d", ib.cfg.MaxConns)
 	}
-	logger.Info("[inbound] 监听 %s → %s  sni=%s insecure=%v max_conns=%s",
+	logger.Info("[inbound] listening %s → %s  sni=%s insecure=%v max_conns=%s",
 		ib.cfg.Listen, ib.cfg.Remote, ib.cfg.SNI, ib.cfg.Insecure, maxConnsStr)
 
-	// 定期打印流量统计
+	// periodically print traffic statistics
 	go ib.statsLoop()
 
 	for {
@@ -93,13 +94,13 @@ func (ib *Inbound) Run() error {
 			continue
 		}
 
-		// 连接数限制：semaphore 满时直接拒绝
+		// connection limit: reject when semaphore is full
 		if ib.sem != nil {
 			select {
 			case ib.sem <- struct{}{}:
-				// 获取到 slot，继续
+				// got slot, continuing
 			default:
-				logger.Warn("[inbound:%s] 连接数已达上限 %d，拒绝连接 from %s",
+				logger.Warn("[inbound:%s] connection limit reached %d, rejecting connection from %s",
 					ib.cfg.Listen, ib.cfg.MaxConns, conn.RemoteAddr())
 				conn.Close()
 				continue
@@ -110,17 +111,17 @@ func (ib *Inbound) Run() error {
 	}
 }
 
-// statsLoop 每60秒打印一次流量统计
+// statsLoop prints traffic stats every 60 seconds
 func (ib *Inbound) statsLoop() {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		logger.Info("[inbound:%s] 统计 | 累计连接: %d  活跃: %d  收: %s  发: %s",
+		logger.Info("[inbound:%s] stats | total: %d  active: %d  rx: %s  tx: %s",
 			ib.cfg.Listen,
 			ib.stats.totalConns.Load(),
 			ib.stats.activeConns.Load(),
-			formatBytes(ib.stats.bytesIn.Load()),
-			formatBytes(ib.stats.bytesOut.Load()),
+			util.FormatBytes(ib.stats.bytesIn.Load()),
+			util.FormatBytes(ib.stats.bytesOut.Load()),
 		)
 	}
 }
@@ -135,7 +136,7 @@ func (ib *Inbound) updateScheme(scheme *padding.Scheme) {
 	ib.schemeMu.Lock()
 	ib.scheme = scheme
 	ib.schemeMu.Unlock()
-	logger.Info("[inbound:%s] padding scheme 已同步更新 md5=%s", ib.cfg.Listen, scheme.MD5())
+	logger.Info("[inbound:%s] padding scheme synced, md5=%s", ib.cfg.Listen, scheme.MD5())
 }
 
 func (ib *Inbound) dialSession() (*session.ClientSession, error) {
@@ -207,7 +208,7 @@ func (ib *Inbound) handleConn(clientConn net.Conn) {
 
 	stream, cs, err := ib.pool.GetStream()
 	if err != nil {
-		logger.Error("[inbound:%s] 获取stream失败: %v", ib.cfg.Listen, err)
+		logger.Error("[inbound:%s] get stream failed: %v", ib.cfg.Listen, err)
 		return
 	}
 	defer func() {
@@ -215,48 +216,14 @@ func (ib *Inbound) handleConn(clientConn net.Conn) {
 		ib.pool.ReturnSession(cs)
 	}()
 
-	logger.Debug("[inbound:%s] stream #%d 已建立", ib.cfg.Listen, stream.ID())
+	logger.Debug("[inbound:%s] stream #%d established", ib.cfg.Listen, stream.ID())
 
-	// 统计流量的双向中继
-	in, out := relayWithStats(clientConn, stream)
+	// bidirectional relay with stats
+	in, out := util.RelayWithStats(clientConn, stream)
 	ib.stats.bytesIn.Add(in)
 	ib.stats.bytesOut.Add(out)
 
-	logger.Debug("[inbound:%s] stream #%d 结束 收%s 发%s",
-		ib.cfg.Listen, stream.ID(), formatBytes(in), formatBytes(out))
+	logger.Debug("[inbound:%s] stream #%d ended  rx%s  tx%s",
+		ib.cfg.Listen, stream.ID(), util.FormatBytes(in), util.FormatBytes(out))
 }
 
-// relayWithStats 双向转发，返回（从a收到的字节数，发给a的字节数）
-func relayWithStats(a, b io.ReadWriter) (int64, int64) {
-	var bytesAtoB, bytesBtoA int64
-	done := make(chan struct{}, 2)
-
-	go func() {
-		n, _ := io.Copy(b, a)
-		bytesAtoB = n
-		done <- struct{}{}
-	}()
-	go func() {
-		n, _ := io.Copy(a, b)
-		bytesBtoA = n
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
-	return bytesAtoB, bytesBtoA
-}
-
-// formatBytes 格式化字节数为人类可读格式
-func formatBytes(n int64) string {
-	switch {
-	case n >= 1<<30:
-		return fmt.Sprintf("%.2fGB", float64(n)/(1<<30))
-	case n >= 1<<20:
-		return fmt.Sprintf("%.2fMB", float64(n)/(1<<20))
-	case n >= 1<<10:
-		return fmt.Sprintf("%.2fKB", float64(n)/(1<<10))
-	default:
-		return fmt.Sprintf("%dB", n)
-	}
-}

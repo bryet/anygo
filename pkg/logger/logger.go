@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// Level 日志级别
+// Level represents log severity
 type Level int
 
 const (
@@ -21,7 +21,7 @@ const (
 
 var currentLevel = LevelInfo
 
-// ParseLevel 解析配置文件里的级别字符串
+// ParseLevel parses a level string from config
 func ParseLevel(s string) (Level, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "debug":
@@ -33,17 +33,25 @@ func ParseLevel(s string) (Level, error) {
 	case "error":
 		return LevelError, nil
 	default:
-		return LevelInfo, fmt.Errorf("未知日志级别 %q，支持: debug/info/warn/error", s)
+		return LevelInfo, fmt.Errorf("unknown log level %q, supported: debug/info/warn/error", s)
 	}
 }
 
-// Init 初始化日志系统
-// 日志文件固定写到程序所在目录下的 anygo.log，同时输出标准输出
-// 若无法创建文件则退化为只写标准输出
+// Init initializes the logging system with log rotation.
+// Log file is written to anygo.log alongside the binary, also outputs to stdout.
+// Falls back to stdout-only if file cannot be created.
+// Uses default rotation: 100 MB max size, 3 backups.
 func Init(levelStr string) {
+	InitWithRotation(levelStr, defaultMaxSizeMB, defaultMaxBackups)
+}
+
+// InitWithRotation initializes the logging system with configurable log rotation.
+// maxSizeMB: maximum log file size in megabytes before rotation (0 = use default 100)
+// maxBackups: number of backup files to keep (0 = use default 3)
+func InitWithRotation(levelStr string, maxSizeMB, maxBackups int) {
 	level, err := ParseLevel(levelStr)
 	if err != nil {
-		log.Printf("警告: %v，使用默认级别 info", err)
+		log.Printf("warning: %v, using default level info", err)
 		level = LevelInfo
 	}
 	currentLevel = level
@@ -53,20 +61,20 @@ func Init(levelStr string) {
 	execPath, err := os.Executable()
 	if err != nil {
 		log.SetOutput(os.Stdout)
-		Warn("获取程序路径失败，日志仅输出到标准输出: %v", err)
+		Warn("failed to get executable path, logging to stdout only: %v", err)
 		return
 	}
 
 	logPath := filepath.Join(filepath.Dir(execPath), "anygo.log")
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	rw, err := newRollingWriter(logPath, maxSizeMB, maxBackups)
 	if err != nil {
 		log.SetOutput(os.Stdout)
-		Warn("无法创建日志文件 %s，日志仅输出到标准输出: %v", logPath, err)
+		Warn("failed to create log file %s, logging to stdout only: %v", logPath, err)
 		return
 	}
 
-	log.SetOutput(io.MultiWriter(os.Stdout, f))
-	Info("日志文件: %s  级别: %s", logPath, levelStr)
+	log.SetOutput(io.MultiWriter(os.Stdout, rw))
+	Info("log file: %s (max %dMB, %d backups)  level: %s", logPath, maxSizeMB, maxBackups, levelStr)
 }
 
 func Debug(format string, args ...any) {

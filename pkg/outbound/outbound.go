@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
 	"sync/atomic"
 	"time"
@@ -14,9 +13,10 @@ import (
 	"anygo/pkg/logger"
 	"anygo/pkg/padding"
 	"anygo/pkg/session"
+	"anygo/pkg/util"
 )
 
-// stats 流量统计
+// stats: traffic statistics
 type stats struct {
 	totalConns  atomic.Int64
 	activeConns atomic.Int64
@@ -24,13 +24,13 @@ type stats struct {
 	bytesOut    atomic.Int64
 }
 
-// Outbound 境外出口节点，扮演AnyTLS服务端角色
+// Outbound exit node, acts as AnyTLS server
 type Outbound struct {
 	cfg    *config.MergedConfig
 	scheme *padding.Scheme
 	stats  stats
 
-	// semaphore 限制最大并发连接数
+	// semaphore limits max concurrent connections
 	sem chan struct{}
 }
 
@@ -39,7 +39,7 @@ func New(cfg *config.MergedConfig) *Outbound {
 	if cfg.PaddingScheme != "" {
 		s, err := padding.Parse(cfg.PaddingScheme)
 		if err != nil {
-			logger.Warn("[outbound] 无效的paddingScheme，使用默认值: %v", err)
+			logger.Warn("[outbound] invalid paddingScheme, using default: %v", err)
 		} else {
 			scheme = s
 		}
@@ -66,10 +66,10 @@ func (ob *Outbound) Run() error {
 	if ob.cfg.MaxConns > 0 {
 		maxConnsStr = fmt.Sprintf("%d", ob.cfg.MaxConns)
 	}
-	logger.Info("[outbound] 监听 %s → %s  padding_md5=%s  max_conns=%s",
+	logger.Info("[outbound] listening %s → %s  padding_md5=%s  max_conns=%s",
 		ob.cfg.Listen, ob.cfg.Remote, ob.scheme.MD5(), maxConnsStr)
 
-	// 定期打印流量统计
+	// periodically print traffic statistics
 	go ob.statsLoop()
 
 	for {
@@ -79,12 +79,12 @@ func (ob *Outbound) Run() error {
 			continue
 		}
 
-		// 连接数限制
+		// connection limit
 		if ob.sem != nil {
 			select {
 			case ob.sem <- struct{}{}:
 			default:
-				logger.Warn("[outbound:%s] 连接数已达上限 %d，拒绝连接 from %s",
+				logger.Warn("[outbound:%s] connection limit reached %d, rejecting connection from %s",
 					ob.cfg.Listen, ob.cfg.MaxConns, conn.RemoteAddr())
 				conn.Close()
 				continue
@@ -99,12 +99,12 @@ func (ob *Outbound) statsLoop() {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		logger.Info("[outbound:%s] 统计 | 累计连接: %d  活跃: %d  收: %s  发: %s",
+		logger.Info("[outbound:%s] stats | total: %d  active: %d  rx: %s  tx: %s",
 			ob.cfg.Listen,
 			ob.stats.totalConns.Load(),
 			ob.stats.activeConns.Load(),
-			formatBytes(ob.stats.bytesIn.Load()),
-			formatBytes(ob.stats.bytesOut.Load()),
+			util.FormatBytes(ob.stats.bytesIn.Load()),
+			util.FormatBytes(ob.stats.bytesOut.Load()),
 		)
 	}
 }
@@ -112,7 +112,7 @@ func (ob *Outbound) statsLoop() {
 func (ob *Outbound) buildTLSConfig() (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(ob.cfg.Cert, ob.cfg.Key)
 	if err != nil {
-		return nil, fmt.Errorf("加载证书失败: %w", err)
+		return nil, fmt.Errorf("failed to load certificate: %w", err)
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -133,16 +133,16 @@ func (ob *Outbound) handleConn(conn net.Conn) {
 	ob.stats.activeConns.Add(1)
 
 	if err := ob.authenticate(conn); err != nil {
-		logger.Warn("[outbound:%s] 认证失败 from %s: %v，fallback HTTP",
+		logger.Warn("[outbound:%s] auth failed from %s: %v, falling back to HTTP",
 			ob.cfg.Listen, conn.RemoteAddr(), err)
 		ob.fallbackHTTP(conn)
 		return
 	}
-	logger.Debug("[outbound:%s] 认证成功: %s", ob.cfg.Listen, conn.RemoteAddr())
+	logger.Debug("[outbound:%s] auth succeeded: %s", ob.cfg.Listen, conn.RemoteAddr())
 
 	ss, err := session.NewServerSession(conn, ob.scheme)
 	if err != nil {
-		logger.Error("[outbound:%s] session握手失败: %v", ob.cfg.Listen, err)
+		logger.Error("[outbound:%s] session handshake failed: %v", ob.cfg.Listen, err)
 		return
 	}
 
@@ -158,11 +158,11 @@ func (ob *Outbound) handleConn(conn net.Conn) {
 func (ob *Outbound) authenticate(conn net.Conn) error {
 	passwordHash, _, err := frame.ReadAuth(conn)
 	if err != nil {
-		return fmt.Errorf("读取认证包失败: %w", err)
+		return fmt.Errorf("failed to read auth packet: %w", err)
 	}
 	expected := sha256.Sum256([]byte(ob.cfg.Password))
-	if !equalBytes(passwordHash, expected[:]) {
-		return fmt.Errorf("密码错误")
+	if !util.EqualBytes(passwordHash, expected[:]) {
+		return fmt.Errorf("wrong password")
 	}
 	return nil
 }
@@ -172,22 +172,22 @@ func (ob *Outbound) handleStream(stream *session.Stream) {
 
 	targetConn, err := net.Dial("tcp", ob.cfg.Remote)
 	if err != nil {
-		logger.Error("[outbound:%s] 连接目标 %s 失败: %v", ob.cfg.Listen, ob.cfg.Remote, err)
+		logger.Error("[outbound:%s] failed to connect to target %s: %v", ob.cfg.Listen, ob.cfg.Remote, err)
 		return
 	}
 	defer targetConn.Close()
 
 	logger.Debug("[outbound:%s] stream #%d → %s", ob.cfg.Listen, stream.ID(), ob.cfg.Remote)
 
-	in, out := relayWithStats(stream, targetConn)
+	in, out := util.RelayWithStats(stream, targetConn)
 	ob.stats.bytesIn.Add(in)
 	ob.stats.bytesOut.Add(out)
 
-	logger.Debug("[outbound:%s] stream #%d 结束 收%s 发%s",
-		ob.cfg.Listen, stream.ID(), formatBytes(in), formatBytes(out))
+	logger.Debug("[outbound:%s] stream #%d ended  rx%s  tx%s",
+		ob.cfg.Listen, stream.ID(), util.FormatBytes(in), util.FormatBytes(out))
 }
 
-// fallbackHTTP 认证失败时返回仿 nginx 的 HTTP 响应，防止主动探测识别
+// fallbackHTTP returns a fake nginx HTTP response on auth failure to resist active probing
 func (ob *Outbound) fallbackHTTP(conn net.Conn) {
 	body := "<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>\n" +
 		"<style>body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;}</style>\n" +
@@ -206,48 +206,4 @@ func (ob *Outbound) fallbackHTTP(conn net.Conn) {
 		body
 
 	conn.Write([]byte(resp))
-}
-
-func relayWithStats(a, b io.ReadWriter) (int64, int64) {
-	var bytesAtoB, bytesBtoA int64
-	done := make(chan struct{}, 2)
-
-	go func() {
-		n, _ := io.Copy(b, a)
-		bytesAtoB = n
-		done <- struct{}{}
-	}()
-	go func() {
-		n, _ := io.Copy(a, b)
-		bytesBtoA = n
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
-	return bytesAtoB, bytesBtoA
-}
-
-func formatBytes(n int64) string {
-	switch {
-	case n >= 1<<30:
-		return fmt.Sprintf("%.2fGB", float64(n)/(1<<30))
-	case n >= 1<<20:
-		return fmt.Sprintf("%.2fMB", float64(n)/(1<<20))
-	case n >= 1<<10:
-		return fmt.Sprintf("%.2fKB", float64(n)/(1<<10))
-	default:
-		return fmt.Sprintf("%dB", n)
-	}
-}
-
-func equalBytes(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := range a {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
 }

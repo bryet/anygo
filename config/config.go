@@ -9,7 +9,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// TunnelConfig 单条转发规则
+// TunnelConfig represents a single forwarding rule
 type TunnelConfig struct {
 	Listen   string `yaml:"listen"`
 	Remote   string `yaml:"remote"`
@@ -18,7 +18,7 @@ type TunnelConfig struct {
 	Password string `yaml:"password"`
 	Cert     string `yaml:"cert"`
 	Key      string `yaml:"key"`
-	// MaxConns 最大并发连接数，0 表示不限制
+	// MaxConns: max concurrent connections, 0 means unlimited
 	MaxConns int `yaml:"max_conns"`
 }
 
@@ -34,47 +34,48 @@ func (t *TunnelConfig) Mode() string {
 
 func (t *TunnelConfig) Validate(idx int) error {
 	if t.Listen == "" {
-		return fmt.Errorf("tunnels[%d]: listen 不能为空", idx)
+		return fmt.Errorf("tunnels[%d]: listen must not be empty", idx)
 	}
 	if _, _, err := net.SplitHostPort(t.Listen); err != nil {
-		return fmt.Errorf("tunnels[%d]: listen 格式错误，应为 host:port: %w", idx, err)
+		return fmt.Errorf("tunnels[%d]: listen format error, expected host:port: %w", idx, err)
 	}
 	if t.Password == "" {
-		return fmt.Errorf("tunnels[%d]: password 不能为空", idx)
+		return fmt.Errorf("tunnels[%d]: password must not be empty", idx)
 	}
 	if t.Remote == "" {
-		return fmt.Errorf("tunnels[%d]: remote 不能为空", idx)
+		return fmt.Errorf("tunnels[%d]: remote must not be empty", idx)
 	}
 	if _, _, err := net.SplitHostPort(t.Remote); err != nil {
-		return fmt.Errorf("tunnels[%d]: remote 格式错误，应为 host:port: %w", idx, err)
+		return fmt.Errorf("tunnels[%d]: remote format error, expected host:port: %w", idx, err)
 	}
 	switch t.Mode() {
 	case "inbound":
 		if t.SNI == "" && !t.Insecure {
-			return fmt.Errorf("tunnels[%d]: inbound 需要配置 sni，或设置 insecure: true", idx)
+			return fmt.Errorf("tunnels[%d]: inbound requires sni, or set insecure: true", idx)
 		}
 	case "outbound":
-		// cert/key 已由 Mode() 确认
+		// cert/key already validated by Mode()
 	default:
-		return fmt.Errorf("tunnels[%d]: 无法识别模式", idx)
+		return fmt.Errorf("tunnels[%d]: cannot determine mode", idx)
 	}
 	return nil
 }
 
-// Config 顶层配置
+// Config top-level configuration
 type Config struct {
-	// 日志级别：debug / info / warn / error，默认 info
+	// log level: debug/info/warn/error, default info
 	LogLevel string `yaml:"log_level"`
 
-	// 全局参数（inbound用）
+	// global parameters (for inbound)
 	IdleSessionCheckInterval string `yaml:"idle_session_check_interval"`
 	IdleSessionTimeout       string `yaml:"idle_session_timeout"`
 	MinIdleSession           int    `yaml:"min_idle_session"`
+	MaxIdleSession           int    `yaml:"max_idle_session"` // hard cap on idle sessions, 0 = no limit
 
-	// 全局参数（outbound用）
+	// global parameters (for outbound)
 	PaddingScheme string `yaml:"padding_scheme"`
 
-	// 多条转发规则，每条独立判断 inbound/outbound，可混用
+	// multiple forwarding rules, each independently determines inbound/outbound, can be mixed
 	Tunnels []TunnelConfig `yaml:"tunnels"`
 }
 
@@ -95,7 +96,7 @@ func (c *Config) applyDefaults() {
 
 func (c *Config) Validate() error {
 	if len(c.Tunnels) == 0 {
-		return errors.New("至少需要配置一条 tunnels 规则")
+		return errors.New("at least one tunnels rule is required")
 	}
 	for i, t := range c.Tunnels {
 		if err := t.Validate(i); err != nil {
@@ -105,12 +106,13 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// MergedConfig 单条规则 + 全局参数
+// MergedConfig combines single rule + global parameters
 type MergedConfig struct {
 	TunnelConfig
 	IdleSessionCheckInterval string
 	IdleSessionTimeout       string
 	MinIdleSession           int
+	MaxIdleSession           int // hard cap on idle sessions, 0 = no limit
 	PaddingScheme            string
 }
 
@@ -120,6 +122,7 @@ func (c *Config) MergeInto(t *TunnelConfig) *MergedConfig {
 		IdleSessionCheckInterval: c.IdleSessionCheckInterval,
 		IdleSessionTimeout:       c.IdleSessionTimeout,
 		MinIdleSession:           c.MinIdleSession,
+		MaxIdleSession:           c.MaxIdleSession,
 		PaddingScheme:            c.PaddingScheme,
 	}
 }
