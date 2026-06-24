@@ -191,7 +191,9 @@ func (ib *Inbound) dialTLS() (net.Conn, error) {
 func (ib *Inbound) sendAuth(conn net.Conn, scheme *padding.Scheme) error {
 	h := sha256.Sum256([]byte(ib.cfg.Password))
 	padding0 := padding.RandBytes(scheme.Padding0Size())
-	return frame.WriteAuth(conn, h[:], padding0)
+	err := frame.WriteAuth(conn, h[:], padding0)
+	padding.ReleaseRandBytes(padding0)
+	return err
 }
 
 func (ib *Inbound) handleConn(clientConn net.Conn) {

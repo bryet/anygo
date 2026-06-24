@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"sync"
 
 	"anygo/config"
@@ -30,6 +31,14 @@ func main() {
 		// logger not yet initialized; use fmt directly
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Tune GC for proxy workloads: lower GOGC reduces peak memory at the cost
+	// of slightly more CPU during high-throughput transfers (e.g., speedtest).
+	// Default is 100; 50 means GC triggers at 150% of live heap vs 200%.
+	// Override by setting GOGC in the environment.
+	if os.Getenv("GOGC") == "" && os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetGCPercent(50)
 	}
 
 	// initialize logger with level from config

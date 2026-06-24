@@ -15,8 +15,8 @@ const (
 
 	// maxReadBufSize is the maximum read buffer size per stream.
 	// When exceeded, the stream is closed to signal backpressure to the sender.
-	// 4 MB is large enough for most TCP workloads while preventing OOM.
-	defaultMaxReadBufSize = 4 * 1024 * 1024
+	// 2 MB balances throughput with memory safety under high concurrency (e.g., speedtest).
+	defaultMaxReadBufSize = 2 * 1024 * 1024
 )
 
 // MaxReadBufSize is the per-stream read buffer limit. Set to 0 for unlimited.
@@ -98,6 +98,11 @@ func (s *Stream) Read(buf []byte) (int, error) {
 		if len(s.readBuf) > 0 {
 			n := copy(buf, s.readBuf)
 			s.readBuf = s.readBuf[n:]
+			// Shrink the backing array if fully drained and capacity is excessive,
+			// preventing the readBuf from retaining peak allocation indefinitely.
+			if len(s.readBuf) == 0 && cap(s.readBuf) > 64*1024 {
+				s.readBuf = nil
+			}
 			return n, nil
 		}
 

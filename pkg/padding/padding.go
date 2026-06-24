@@ -150,11 +150,34 @@ func RandInRange(min, max int) int {
 	return min + int(n.Int64())
 }
 
-// RandBytes generates n bytes of random data
+// randBytesPool reuses random padding buffers. Waste frames in applyPadding
+// generate small random buffers per packet; pooling avoids repeated allocation.
+var randBytesPool = sync.Pool{
+	New: func() any { return make([]byte, 0, 1024) },
+}
+
+// RandBytes generates n bytes of random data.
+// Uses a pool for sizes up to 1024 to reduce GC pressure during active sessions.
 func RandBytes(n int) []byte {
+	if n <= 1024 {
+		pooled := randBytesPool.Get().([]byte)
+		if cap(pooled) >= n {
+			b := pooled[:n]
+			rand.Read(b)
+			return b
+		}
+	}
 	b := make([]byte, n)
 	rand.Read(b)
 	return b
+}
+
+// ReleaseRandBytes returns a RandBytes-allocated buffer to the pool.
+// Safe to call with nil or buffers not from the pool.
+func ReleaseRandBytes(b []byte) {
+	if b != nil && cap(b) <= 1024 && cap(b) >= 1 {
+		randBytesPool.Put(b[:0])
+	}
 }
 
 // Padding0Size returns the padding0 size based on rule 0 of the scheme

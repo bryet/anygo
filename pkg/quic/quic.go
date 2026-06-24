@@ -772,10 +772,16 @@ func (ib *Inbound) heartbeatLoop(qconn *quicgo.Conn) {
 	}
 }
 
-// cleanupLoop periodically cleans up idle sessions and sends TUIC v5 Dissociate commands
+// cleanupLoop periodically cleans up idle sessions and sends TUIC v5 Dissociate commands.
+// Also compacts the sessions map when it becomes empty to prevent Go map backing-array
+// retention after traffic spikes.
 func (ib *Inbound) cleanupLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+
+	compactTick := 0
+	const compactEvery = 20 // compact every 20 × 15s = 5 minutes
+
 	for range ticker.C {
 		now := time.Now()
 		ib.sessionsMu.Lock()
@@ -785,6 +791,15 @@ func (ib *Inbound) cleanupLoop() {
 				toRemove = append(toRemove, s)
 				delete(ib.sessions, key)
 			}
+		}
+
+		// Compact the map periodically: if empty, replace to release peak capacity.
+		// Go maps don't shrink; a spike of 10k clients would retain ~1MB+ of hash table
+		// indefinitely without this.
+		compactTick++
+		if compactTick >= compactEvery && len(ib.sessions) == 0 {
+			ib.sessions = make(map[string]*inSession)
+			compactTick = 0
 		}
 		ib.sessionsMu.Unlock()
 
@@ -1141,48 +1156,6 @@ func (cs *connState) handleAuth(r io.Reader) {
 	}
 	cs.authed.Store(true)
 	logger.Debug("[tuic-outbound] auth succeeded: %s", cs.qconn.RemoteAddr())
-}
-
-// handlePacket processes the TUIC v5 Packet command
-// (VER+TYPE already read)
-func (cs *connState) handlePacket(r io.Reader) {
-	pkt, err := readPacket(r)
-	if err != nil {
-		return
-	}
-
-	cs.ob.stats.bytesIn.Add(int64(pkt.size))
-	logger.Debug("[tuic-outbound] ← Packet assocID=%d pktID=%d frag=%d/%d size=%d",
-		pkt.assocID, pkt.pktID, pkt.fragID+1, pkt.fragTotal, pkt.size)
-
-	// get or create the UDP socket for this assocID
-	cs.sessionsMu.Lock()
-	sess, ok := cs.sessions[pkt.assocID]
-	if !ok {
-		udpConn, err := net.DialUDP("udp", nil, cs.ob.targetAddr)
-		if err != nil {
-			cs.sessionsMu.Unlock()
-			logger.Error("[tuic-outbound] failed to create UDP socket assocID=%d: %v", pkt.assocID, err)
-			return
-		}
-		sess = &outSession{
-			assocID:    pkt.assocID,
-			udpConn:    udpConn,
-			lastActive: time.Now(),
-		}
-		cs.sessions[pkt.assocID] = sess
-		logger.Debug("[tuic-outbound] new session assocID=%d → %s", pkt.assocID, cs.ob.targetAddr)
-		// start receive loop: target → client
-		go cs.recvFromTarget(pkt.assocID, sess)
-	}
-	cs.sessionsMu.Unlock()
-
-	sess.touch()
-
-	// send to target UDP node
-	if _, err := sess.udpConn.Write(pkt.data); err != nil {
-		logger.Debug("[tuic-outbound] UDP send failed assocID=%d: %v", pkt.assocID, err)
-	}
 }
 
 // handleDissociate processes the TUIC v5 Dissociate command

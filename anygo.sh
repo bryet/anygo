@@ -434,7 +434,6 @@ log_level: "info"
 idle_session_check_interval: "30s"
 idle_session_timeout: "60s"
 min_idle_session: 2
-max_idle_session: 10
 
 padding_scheme: |
   stop=8

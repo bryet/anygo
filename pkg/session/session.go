@@ -171,7 +171,9 @@ func (s *Session) applyPadding(streamID uint32, data []byte, segs []padding.Segm
 			offset = end
 		} else {
 			waste := padding.RandBytes(targetSize)
-			if err := frame.WriteFrame(s.conn, frame.CmdWaste, 0, waste); err != nil {
+			err := frame.WriteFrame(s.conn, frame.CmdWaste, 0, waste)
+			padding.ReleaseRandBytes(waste)
+			if err != nil {
 				return err
 			}
 		}
@@ -200,9 +202,11 @@ func (s *Session) recvLoop() {
 			return
 		}
 		if err := s.handleFrame(f); err != nil {
+			frame.ReleaseData(f.Data)
 			s.close(err)
 			return
 		}
+		frame.ReleaseData(f.Data)
 	}
 }
 
@@ -450,7 +454,7 @@ type ServerSession struct {
 func NewServerSession(conn net.Conn, serverScheme *padding.Scheme) (*ServerSession, error) {
 	ss := &ServerSession{
 		Session:  newSession(conn, false, serverScheme),
-		acceptCh: make(chan *Stream, 64),
+		acceptCh: make(chan *Stream, 256),
 	}
 
 	settingsCh := make(chan map[string]string, 1)
@@ -511,12 +515,14 @@ func (ss *ServerSession) serverRecvLoop(settingsCh chan map[string]string) {
 
 		if !settingsSent {
 			if f.Command != frame.CmdSettings {
+				frame.ReleaseData(f.Data)
 				ss.writeFrame(frame.CmdAlert, 0, []byte("expected cmdSettings first"))
 				ss.close(fmt.Errorf("protocol violation"))
 				return
 			}
 			settingsSent = true
 			settingsCh <- parseSettings(f.Data)
+			frame.ReleaseData(f.Data)
 			continue
 		}
 
@@ -529,21 +535,27 @@ func (ss *ServerSession) serverRecvLoop(settingsCh chan map[string]string) {
 
 			if ss.remoteVersion >= 2 {
 				sid := f.StreamID
-				go ss.writeFrame(frame.CmdSYNACK, sid, nil)
+				// SYNACK is a small frame; write under the serverRecvLoop
+				// goroutine directly — no need for a separate goroutine.
+				ss.writeFrame(frame.CmdSYNACK, sid, nil)
 			}
 
 			select {
 			case ss.acceptCh <- st:
 			default:
+				log.Printf("[server-session] accept queue full, rejecting stream %d", f.StreamID)
 				st.closeByRemote()
 				ss.writeFrame(frame.CmdFIN, f.StreamID, nil)
 			}
+			// CmdSYN has no data body; nothing to release
 
 		default:
 			if err := ss.handleFrame(f); err != nil {
+				frame.ReleaseData(f.Data)
 				ss.close(err)
 				return
 			}
+			frame.ReleaseData(f.Data)
 		}
 	}
 }
