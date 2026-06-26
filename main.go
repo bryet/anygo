@@ -46,7 +46,10 @@ func detectMemoryLimit() int64 {
 	return 512 << 20
 }
 
-const version = "0.1.0"
+// version is set via -ldflags at build time, e.g.:
+//   go build -ldflags "-X main.version=v1.2.3" -o anygo .
+// Falls back to "dev" when built without -ldflags.
+var version = "dev"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "config file path")

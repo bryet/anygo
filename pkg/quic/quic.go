@@ -65,8 +65,9 @@ const (
 	addrIPv4   = 0x01
 	addrIPv6   = 0x02
 
-	// QUIC ALPN used by anygo (distinct from external TUIC nodes)
-	quicALPN = "anygo-quic"
+	// QUIC ALPN — compatible with standard TUIC v5 implementations (e.g. sing-box).
+	// Change to a custom value if you want to isolate anygo from other TUIC nodes.
+	quicALPN = "tuic-v5"
 
 	// timeouts
 	dialTimeout    = 10 * time.Second
@@ -580,18 +581,18 @@ func (ib *Inbound) handleUDP(clientAddr *net.UDPAddr, data []byte) {
 	ib.stats.totalPkts.Add(1)
 	ib.stats.bytesIn.Add(int64(len(data)))
 
+	qconn, err := ib.getConn()
+	if err != nil {
+		logger.Error("[tuic-inbound] failed to get QUIC connection: %v", err)
+		return
+	}
+
 	sess := ib.getOrCreateSession(clientAddr)
 	if sess == nil {
 		// Session cap reached; packet dropped (already logged in getOrCreateSession).
 		return
 	}
 	sess.touch()
-
-	qconn, err := ib.getConn()
-	if err != nil {
-		logger.Error("[tuic-inbound] failed to get QUIC connection: %v", err)
-		return
-	}
 
 	// build Packet command
 	pkt := tuicPacket{
@@ -770,15 +771,18 @@ func (ib *Inbound) recvLoop(qconn *quicgo.Conn) {
 		ib.sessionsMu.Unlock()
 
 		if target == nil {
-			logger.Debug("[tuic-inbound] received response for unknown assocID=%d, ignoring", pkt.assocID)
+			logger.Warn("[tuic-inbound] response for UNKNOWN assocID=%d, ignoring", pkt.assocID)
 			continue
 		}
 
 		target.touch()
 		ib.stats.bytesOut.Add(int64(len(data)))
-		ib.localConn.WriteToUDP(data, target.clientAddr)
-		logger.Debug("[tuic-inbound] ← Packet(dgram) assocID=%d pktID=%d size=%d → %s",
-			pkt.assocID, pkt.pktID, len(data), target.clientAddr)
+		n, err := ib.localConn.WriteToUDP(data, target.clientAddr)
+		if err != nil {
+			logger.Warn("[tuic-inbound] WriteToUDP error assocID=%d addr=%s: %v", pkt.assocID, target.clientAddr, err)
+		}
+		logger.Debug("[tuic-inbound] <- Packet(dgram) assocID=%d pktID=%d size=%d -> %s written=%d",
+			pkt.assocID, pkt.pktID, len(data), target.clientAddr, n)
 	}
 }
 
@@ -1034,13 +1038,21 @@ func (ob *Outbound) handleConn(qconn *quicgo.Conn) {
 		maxSessions: maxOutSess,
 	}
 
-	// accept datagrams (Heartbeat)
-	go cs.recvDatagrams()
+	// Per TUIC v5 spec, the first unidirectional stream MUST be Authenticate.
+	// We must process it BEFORE starting recvDatagrams, otherwise a Packet
+	// datagram that arrives before the AUTH stream is processed gets silently
+	// dropped (authed==false). This is the root cause of "first packet lost"
+	// and makes UDP tunnels appear non-functional with single-packet tests.
+	if err := cs.waitAuth(); err != nil {
+		qconn.CloseWithError(1, "auth timeout")
+		return
+	}
 
-	// session idle cleanup
+	// Now safe to receive datagrams and remaining streams.
+	go cs.recvDatagrams()
 	go cs.sessionCleanup()
 
-	// loop accepting unidirectional streams
+	// loop accepting remaining unidirectional streams
 	for {
 		stream, err := qconn.AcceptUniStream(context.Background())
 		if err != nil {
@@ -1055,6 +1067,42 @@ func (ob *Outbound) handleConn(qconn *quicgo.Conn) {
 		s.close()
 	}
 	cs.sessionsMu.Unlock()
+}
+
+// waitAuth waits for and processes the first unidirectional stream, which per
+// TUIC v5 spec MUST be an Authenticate command. Must complete before starting
+// recvDatagrams to prevent dropping early Packet datagrams.
+func (cs *connState) waitAuth() error {
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	stream, err := cs.qconn.AcceptUniStream(ctx)
+	if err != nil {
+		return err
+	}
+	return cs.handleAuthStream(stream)
+}
+
+// handleAuthStream reads and processes an Authenticate command from a stream.
+func (cs *connState) handleAuthStream(stream *quicgo.ReceiveStream) error {
+	r := &receiveStreamReader{s: stream}
+	defer (*stream).CancelRead(0)
+	(*stream).SetReadDeadline(time.Now().Add(dialTimeout))
+
+	hdr := make([]byte, 2)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return fmt.Errorf("auth: failed to read header: %w", err)
+	}
+	if hdr[0] != tuicVersion {
+		return fmt.Errorf("auth: unknown TUIC version 0x%02x", hdr[0])
+	}
+	if hdr[1] != cmdAuthenticate {
+		return fmt.Errorf("auth: expected cmdAuthenticate(0x00), got 0x%02x", hdr[1])
+	}
+	cs.handleAuth(r)
+	if !cs.authed.Load() {
+		return fmt.Errorf("auth: authentication rejected")
+	}
+	return nil
 }
 
 // recvDatagrams handles all inbound datagrams: Heartbeat and Packet commands
@@ -1240,8 +1288,10 @@ func (cs *connState) recvFromTarget(assocID uint16, sess *outSession) {
 
 		n, srcAddr, err := sess.udpConn.ReadFromUDP(buf)
 		if err != nil {
+			logger.Warn("[tuic-outbound] ReadFromUDP error assocID=%d: %v", assocID, err)
 			return
 		}
+		logger.Debug("[tuic-outbound] ← target assocID=%d size=%d src=%s", assocID, n, srcAddr)
 
 		sess.touch()
 		cs.ob.stats.bytesOut.Add(int64(n))
@@ -1269,12 +1319,11 @@ func (cs *connState) recvFromTarget(assocID uint16, sess *outSession) {
 
 		// push back to inbound via datagram (auto-fragment if exceeding maxDatagramPayload)
 		if err := sendDatagramPkt(cs.qconn, pkt); err != nil {
-			logger.Debug("[tuic-outbound] failed to send datagram assocID=%d: %v", assocID, err)
+			logger.Warn("[tuic-outbound] sendDatagramPkt error assocID=%d: %v", assocID, err)
 			return
 		}
-
-		logger.Debug("[tuic-outbound] → Packet(dgram) assocID=%d pktID=%d size=%d src=%s",
-			assocID, pkt.pktID, n, srcAddr)
+		logger.Debug("[tuic-outbound] -> Packet(dgram) assocID=%d pktID=%d size=%d",
+			assocID, pkt.pktID, n)
 	}
 }
 
