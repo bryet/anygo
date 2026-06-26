@@ -50,9 +50,10 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: 0
         run: |
-          go mod tidy \
-          && go build -trimpath \
-            -ldflags "-s -w -buildid=" \
+          VERSION="${{ steps.set_version.outputs.version }}"
+          go mod tidy
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}" \
             -o anygo .
 
           tar -czf "anygo-linux-${{ matrix.arch }}.tar.gz" \
