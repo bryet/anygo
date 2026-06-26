@@ -220,8 +220,10 @@ func (ib *Inbound) handleConn(clientConn net.Conn) {
 
 	logger.Debug("[inbound:%s] stream #%d established", ib.cfg.Listen, stream.ID())
 
-	// bidirectional relay with stats
-	in, out := util.RelayWithStats(clientConn, stream)
+	// bidirectional relay with deadline protection:
+	// if either side stalls, the deadline fires and io.Copy unblocks,
+	// preventing goroutine leaks from hung connections.
+	in, out := util.RelayWithDeadline(clientConn, stream)
 	ib.stats.bytesIn.Add(in)
 	ib.stats.bytesOut.Add(out)
 

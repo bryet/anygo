@@ -179,7 +179,9 @@ func (ob *Outbound) handleStream(stream *session.Stream) {
 
 	logger.Debug("[outbound:%s] stream #%d → %s", ob.cfg.Listen, stream.ID(), ob.cfg.Remote)
 
-	in, out := util.RelayWithStats(stream, targetConn)
+	// relay with deadline protection: if the target is unresponsive,
+	// the deadline ensures goroutines don't leak indefinitely.
+	in, out := util.RelayWithDeadline(stream, targetConn)
 	ob.stats.bytesIn.Add(in)
 	ob.stats.bytesOut.Add(out)
 

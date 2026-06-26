@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,6 +79,19 @@ const (
 	// max QUIC datagram payload (conservative; reserves space for TUIC header + QUIC frame overhead)
 	// UDP packets larger than this are automatically fragmented and reassembled on the receive side
 	maxDatagramPayload = 1100
+
+	// maxInboundSessions is the hard cap on the number of inSession entries per Inbound.
+	// Each entry represents a unique client (source IP:port → assocID mapping).
+	// Without a cap, a flood of spoofed source addresses can grow the sessions map
+	// unboundedly; Go maps never shrink their backing array, so even idle cleanup
+	// cannot reclaim hash-table memory after a spike. Override by setting MAX_TUIC_SESSIONS
+	// in the environment, or 0 to disable (not recommended for production).
+	defaultMaxInboundSessions = 50000
+
+	// maxOutboundSessionsPerConn is the hard cap on outSession entries per QUIC
+	// connection on the outbound side. Each entry holds a UDP socket (fd + kernel
+	// buffers). 0 disables.
+	defaultMaxOutboundSessionsPerConn = 10000
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -465,9 +480,10 @@ type Inbound struct {
 	dialMu  sync.Mutex
 	dialing *dialCall
 
-	sessions   map[string]*inSession // clientAddr → session
-	sessionsMu sync.Mutex
-	nextAssoc  uint16
+	sessions    map[string]*inSession // clientAddr → session
+	sessionsMu  sync.Mutex
+	nextAssoc   uint16
+	maxSessions int // hard cap on sessions map size; 0 = use default
 
 	stats inboundStats
 	sem   chan struct{}
@@ -475,8 +491,14 @@ type Inbound struct {
 
 func NewInbound(cfg *config.MergedConfig) *Inbound {
 	ib := &Inbound{
-		cfg:      cfg,
-		sessions: make(map[string]*inSession),
+		cfg:         cfg,
+		sessions:    make(map[string]*inSession),
+		maxSessions: defaultMaxInboundSessions,
+	}
+	if v := os.Getenv("MAX_TUIC_SESSIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			ib.maxSessions = n
+		}
 	}
 	if cfg.MaxConns > 0 {
 		ib.sem = make(chan struct{}, cfg.MaxConns)
@@ -529,6 +551,14 @@ func (ib *Inbound) getOrCreateSession(clientAddr *net.UDPAddr) *inSession {
 	if s, ok := ib.sessions[key]; ok {
 		return s
 	}
+	// Hard cap: prevent sessions map from growing unboundedly.
+	// Go maps never shrink their backing array, so even after idle cleanup
+	// the hash-table memory from a spike is retained indefinitely.
+	if ib.maxSessions > 0 && len(ib.sessions) >= ib.maxSessions {
+		logger.Warn("[tuic-inbound] sessions cap reached (%d), rejecting new client %s",
+			ib.maxSessions, key)
+		return nil
+	}
 	ib.nextAssoc++
 	s := &inSession{
 		assocID:    ib.nextAssoc,
@@ -551,6 +581,10 @@ func (ib *Inbound) handleUDP(clientAddr *net.UDPAddr, data []byte) {
 	ib.stats.bytesIn.Add(int64(len(data)))
 
 	sess := ib.getOrCreateSession(clientAddr)
+	if sess == nil {
+		// Session cap reached; packet dropped (already logged in getOrCreateSession).
+		return
+	}
 	sess.touch()
 
 	qconn, err := ib.getConn()
@@ -967,14 +1001,15 @@ func (ob *Outbound) Run() error {
 
 // connState holds per-QUIC-connection state
 type connState struct {
-	ob         *Outbound
-	qconn      *quicgo.Conn
-	authed     atomic.Bool
-	sessions   map[uint16]*outSession
-	sessionsMu sync.Mutex
+	ob          *Outbound
+	qconn       *quicgo.Conn
+	authed      atomic.Bool
+	sessions    map[uint16]*outSession
+	sessionsMu  sync.Mutex
+	maxSessions int // hard cap on outSession entries (0 = use default)
 	// pending command buffer (commands arriving before auth are buffered)
-	pendingMu  sync.Mutex
-	pending    []func()
+	pendingMu sync.Mutex
+	pending   []func()
 }
 
 func (ob *Outbound) handleConn(qconn *quicgo.Conn) {
@@ -986,10 +1021,17 @@ func (ob *Outbound) handleConn(qconn *quicgo.Conn) {
 		}
 	}()
 
+	maxOutSess := defaultMaxOutboundSessionsPerConn
+	if v := os.Getenv("MAX_TUIC_OUTBOUND_SESSIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			maxOutSess = n
+		}
+	}
 	cs := &connState{
-		ob:       ob,
-		qconn:    qconn,
-		sessions: make(map[uint16]*outSession),
+		ob:          ob,
+		qconn:       qconn,
+		sessions:    make(map[uint16]*outSession),
+		maxSessions: maxOutSess,
 	}
 
 	// accept datagrams (Heartbeat)
@@ -1064,6 +1106,14 @@ func (cs *connState) recvDatagrams() {
 			cs.sessionsMu.Lock()
 			sess, ok2 := cs.sessions[pkt.assocID]
 			if !ok2 {
+				// Hard cap: prevent per-connection sessions from growing
+				// unboundedly (each holds a UDP socket fd + kernel buffers).
+				if cs.maxSessions > 0 && len(cs.sessions) >= cs.maxSessions {
+					cs.sessionsMu.Unlock()
+					logger.Warn("[tuic-outbound] per-conn sessions cap reached (%d), dropping assocID=%d",
+						cs.maxSessions, pkt.assocID)
+					continue
+				}
 				udpConn, err := net.DialUDP("udp", nil, cs.ob.targetAddr)
 				if err != nil {
 					cs.sessionsMu.Unlock()

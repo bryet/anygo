@@ -72,6 +72,10 @@ func WriteFrame(w io.Writer, cmd uint8, streamID uint32, data []byte) error {
 		if cap(pooled) >= size {
 			buf = pooled[:size]
 		} else {
+			// Return undersized buffer to pool; allocating fresh one.
+			// Without this, every oversized frame permanently removes a
+			// buffer from the pool, raising allocation pressure over time.
+			writeBufPool.Put(pooled[:0])
 			buf = make([]byte, size)
 		}
 	} else {
@@ -113,7 +117,10 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 			if cap(pooled) >= int(dataLen) {
 				data = pooled[:dataLen]
 			} else {
-				// Pooled buffer too small, allocate fresh and discard pooled
+				// Return undersized buffer to pool; allocating fresh one.
+				// Without this, every oversized frame permanently removes a
+				// buffer from the pool, raising allocation pressure over time.
+				frameDataPool.Put(pooled[:0])
 				data = make([]byte, dataLen)
 			}
 		} else {

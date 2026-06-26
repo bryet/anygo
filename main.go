@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 
 	"anygo/config"
@@ -13,6 +15,36 @@ import (
 	"anygo/pkg/outbound"
 	"anygo/pkg/quic"
 )
+
+// detectMemoryLimit tries to determine a reasonable GOMEMLIMIT value.
+// Priority: cgroup v2 → cgroup v1 → 512 MiB default.
+// Returns 0 if a limit cannot be determined (caller should not override).
+func detectMemoryLimit() int64 {
+	// cgroup v2 (Docker / Kubernetes default)
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if s != "max" {
+			if n, err := strconv.ParseInt(s, 10, 64); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	// cgroup v1
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil && n > 0 {
+			// A value near MaxInt64 means "no limit" in cgroup v1.
+			if n < (1 << 50) { // sanity cap at ~1 PB
+				return n
+			}
+		}
+	}
+	// No cgroup — use a conservative default that prevents the Go runtime
+	// from holding more than 512 MiB of OS memory. This is safe for most
+	// VPS deployments (1-2 GB total RAM) while still allowing bursts.
+	// Override by setting GOMEMLIMIT in the environment.
+	return 512 << 20
+}
 
 const version = "0.1.0"
 
@@ -33,12 +65,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Tune GC for proxy workloads: lower GOGC reduces peak memory at the cost
-	// of slightly more CPU during high-throughput transfers (e.g., speedtest).
-	// Default is 100; 50 means GC triggers at 150% of live heap vs 200%.
-	// Override by setting GOGC in the environment.
-	if os.Getenv("GOGC") == "" && os.Getenv("GOMEMLIMIT") == "" {
+	// ── GC tuning for long-running proxy workloads ─────────────────────────
+	//
+	// Without these settings, the Go runtime tends to retain OS memory after
+	// traffic spikes (it prioritizes GC CPU cost over memory). Over days/weeks
+	// this looks like a continuous memory leak even though the live heap is
+	// stable. Two knobs work together:
+	//
+	//   GOGC=50        — GC triggers at 150% of live heap (vs default 200%).
+	//                    More CPU but lower peak memory during speedtests.
+	//   GOMEMLIMIT     — Soft memory cap. Go runs GC more aggressively as the
+	//                    heap approaches this limit, preventing runaway growth.
+	//                    Go 1.19+ reads this from the env var automatically.
+	//
+	// Both can be overridden via environment variables.
+	if os.Getenv("GOGC") == "" {
 		debug.SetGCPercent(50)
+	}
+	// If GOMEMLIMIT is not set and we are not in a cgroup, use a reasonable
+	// default. In containerized deployments the cgroup limit takes precedence.
+	if os.Getenv("GOMEMLIMIT") == "" {
+		limit := detectMemoryLimit()
+		if limit > 0 {
+			debug.SetMemoryLimit(limit)
+		}
 	}
 
 	// initialize logger with level from config

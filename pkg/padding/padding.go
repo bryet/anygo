@@ -166,6 +166,11 @@ func RandBytes(n int) []byte {
 			rand.Read(b)
 			return b
 		}
+		// Return undersized buffer to pool; allocating fresh one.
+		// Without this, every RandBytes call with n <= 1024 where the
+		// pooled buffer is too small permanently removes it from the pool,
+		// raising allocation pressure and GC frequency over time.
+		randBytesPool.Put(pooled[:0])
 	}
 	b := make([]byte, n)
 	rand.Read(b)
